@@ -1,0 +1,11 @@
+/* Minimal additions on top of Bootstrap dark theme */
+.codebox {
+  background: #0f172a;
+  border: 1px solid #24304c;
+  color: #d1e7ff;
+  padding: 1rem;
+  border-radius: .5rem;
+  min-height: 84px;
+  white-space: pre-wrap;
+}
+.table-responsive { border: 1px solid #24304c; border-radius: .5rem; }

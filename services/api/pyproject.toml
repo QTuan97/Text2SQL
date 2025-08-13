@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "nlstack"
+version = "0.2.0"
+description = "FastAPI + Qdrant + Ollama + Postgres (local, CPU) with clean routing"
+authors = ["QTuan97"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.115.0"
+uvicorn = {extras = ["standard"], version = "^0.30.0"}
+httpx = "^0.27.0"
+pydantic = "^2.8.0"
+qdrant-client = "^1.9.0"
+sqlglot = "^25.0.0"
+psycopg = {extras = ["binary"], version = "^3.2.1"}
+python-dotenv = "^1.0.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"

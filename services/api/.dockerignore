@@ -1,0 +1,44 @@
+# --- Secrets (never send to Docker daemon)
+.env
+*.env
+.env.*
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+
+# --- Python/Poetry junk
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.eggs/
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+
+# --- Caches & test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# --- Git/IDE
+.git
+.gitignore
+.vscode/
+.idea/
+
+# --- Local data (if any in this context)
+data/
+qdrant_data/
+pg_data/
+.ollama/
+
+# --- Node leftovers (if any)
+node_modules/
+npm-debug.log*
+yarn-error.log*

@@ -1,0 +1,66 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports: ["6333:6333"]
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: appdb
+    ports: ["5435:5432"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports: ["11434:11434"]
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: [ "CMD", "sh", "-lc", "ollama list >/dev/null 2>&1 || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 20
+
+  api:
+    build: ./services/api
+    restart: unless-stopped
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      QDRANT_URL: http://qdrant:6333
+      POSTGRES_URL: postgresql://test:123123@postgres:5432/appdb
+      QDRANT_COLLECTION: pipeline_events
+      VALID_NAME: valid_vec
+      VALID_DIM: "768"
+      ERROR_NAME: error_vec
+      ERROR_DIM: "384"
+      GEN_MODEL: llama3.2:1b-instruct-q4_K_M
+      VALID_EMBED_MODEL: nomic-embed-text
+      ERROR_EMBED_MODEL: all-minilm
+      CORS_ORIGINS: http://localhost:8080
+    depends_on:
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    ports: ["8000:8000"]
+
+  ui:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./services/ui:/usr/share/nginx/html:ro
+    ports: ["8080:80"]
+
+volumes:
+  qdrant_data:
+  pg_data:
+  ollama:
