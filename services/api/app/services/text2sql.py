@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from sqlglot import parse_one
 from ..clients.postgres import schema_snapshot, pg_connect
 from ..services.generation import llm
+from ..semantic.provider import get_context
 
 # ---------- helpers ----------
 def _strip_fences(txt: str) -> str:
@@ -52,28 +53,25 @@ def _sanitize_sql(sql: str, limit: int) -> str:
 # ---------- public API ----------
 async def generate_sql(question: str, limit: int) -> str:
     schema = schema_snapshot()
-    base = f"""You translate questions to SQL for PostgreSQL. Use ONLY this schema.
-    Rules:
-    - Use explicit JOINs with short aliases (users AS u, orders AS o).
-    - If you use aggregates (SUM/COUNT/AVG…), every non-aggregated selected column
-      MUST be in GROUP BY.
-    - Sort “top … by total” queries by the aggregate DESC.
-    - Prefer selecting both u.id and u.name for user-level summaries.
+    mdl_ctx = get_context()
+    base = f"""You generate PostgreSQL SELECT queries.
     
-    Example pattern for user totals:
-    SELECT u.id, u.name, SUM(o.amount) AS total_amount
-    FROM orders o JOIN users u ON u.id = o.user_id
-    GROUP BY u.id, u.name
-    ORDER BY total_amount DESC
-    LIMIT {limit};
+    # Semantic Layer (authoritative)
+    {mdl_ctx}
     
-    Write ONE SELECT statement with explicit JOINs and short aliases.
-    If LIMIT is missing, add LIMIT {limit}.
-    Schema:
+    # Live schema snapshot (for column names/types)
     {schema}
     
-    Question: {question}"""
-    # try once
+    Instructions:
+    - Follow the 'Rules' in the Semantic Layer exactly.
+    - Use only tables/columns present above and relationships defined in the Semantic Layer.
+    - Use explicit JOINs with short aliases (e.g., users AS u, orders AS o).
+    - For aggregates (SUM/COUNT/AVG), every non-aggregated selected column MUST be in GROUP BY.
+    - For "top … by total", ORDER BY the aggregate DESC.
+    - If LIMIT is missing for list-like results, add LIMIT {limit}. Aggregations do not require LIMIT.
+    
+    Question: {question}
+    Return ONLY JSON: {{"sql":"<single valid PostgreSQL SELECT>"}}"""
     txt = await llm(_json_only(base))
     try:
         sql = _parse_sql_from_model(txt)

@@ -1,0 +1,57 @@
+version: 1
+source:
+  name: appdb
+  type: postgres
+  schema: public
+conventions:
+  sql_dialect: postgres
+  default_time_grain: month
+
+entities:
+  - name: user
+    table: users
+    primary_key: id
+    synonyms: [customer, client, member]
+    dimensions:
+      - { name: id,        column: id,        type: integer }
+      - { name: name,      column: name,      type: text, synonyms: [username, full name] }
+      - { name: city,      column: city,      type: text, synonyms: [location] }
+
+  - name: order
+    table: orders
+    primary_key: id
+    synonyms: [purchase, sale, transaction]
+    foreign_keys:
+      - { column: user_id, references: users.id }
+    dimensions:
+      - { name: id,          column: id,          type: integer }
+      - { name: user_id,     column: user_id,     type: integer }
+      - { name: amount,      column: amount,      type: numeric, unit: currency, synonyms: [total, price, revenue] }
+      - { name: created_at,  column: created_at,  type: timestamp, role: time, grains: [day, week, month, quarter, year], synonyms: [order_date, date] }
+
+relationships:
+  - name: user_orders
+    left:  { entity: user,  column: id }
+    right: { entity: order, column: user_id }
+    type: one_to_many
+    join_sql: "users.id = orders.user_id"
+
+metrics:
+  - { name: revenue,         entity: order, expression: "SUM(orders.amount)", unit: currency, synonyms: [sales, turnover] }
+  - { name: orders_count,    entity: order, expression: "COUNT(orders.id)",   synonyms: [number of orders] }
+  - { name: avg_order_value, entity: order, expression: "AVG(orders.amount)", synonyms: [aov] }
+
+rules:
+  - "SELECT-only; no INSERT/UPDATE/DELETE."
+  - "Use qualified names where helpful and explicit JOINs through defined relationships."
+  - "If the question mentions 'last N days/weeks/months', filter orders.created_at accordingly."
+  - "For aggregate queries, every non-aggregated selected column MUST be in GROUP BY."
+  - "For list-like questions include LIMIT inferred from the question (default 50). Aggregations do not need LIMIT."
+  - "For time rollups, group by the requested grain on orders.created_at."
+
+synonyms:
+  phrases:
+    "sales": metrics.revenue
+    "revenue": metrics.revenue
+    "number of purchases": metrics.orders_count
+    "top customers": users.name

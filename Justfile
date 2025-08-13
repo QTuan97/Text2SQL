@@ -4,7 +4,7 @@ compose_p := "{{compose}} -p {{project}}"
 set shell := ["bash","-eu","-o","pipefail","-c"]
 set dotenv-load := true
 set export := true
-
+API_URL    := "http://localhost:8000"
 
 up:
 	docker compose up -d --build
@@ -39,7 +39,16 @@ pg_init:
     docker compose exec -T postgres psql -U postgres -d appdb -c "ALTER SCHEMA public OWNER TO app;"
 
 seed_pg:
-    docker compose exec -T postgres psql -U test -d appdb < scripts/seed_pg.sql
+    docker compose exec -T postgres psql -U app -d appdb < scripts/seed_pg.sql
+
+semantic-migrate:
+	docker compose exec -T postgres psql -U app -d appdb -v ON_ERROR_STOP=1 -f - < scripts/migrate.sql
+
+semantic-seed:
+	docker compose exec -T postgres psql -U app -d appdb -v ON_ERROR_STOP=1 -f - < scripts/seed_migrate.sql
+
+semantic-reload:
+	curl -fsS -X POST "{{API_URL}}/semantic/reload" || true
 
 # Tail Ollama logs
 ollama-logs:

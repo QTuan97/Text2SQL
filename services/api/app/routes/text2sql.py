@@ -1,7 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks
 import time
 from ..schemas.common import NL2SQLIn
-from ..services.text2sql import generate_sql, execute_sql
+from ..services.text2sql import generate_sql, execute_sql, repair_sql
 from ..services.logger import log_request
 from ..config import settings
 

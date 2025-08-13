@@ -36,7 +36,7 @@ services:
     environment:
       OLLAMA_BASE_URL: http://ollama:11434
       QDRANT_URL: http://qdrant:6333
-      POSTGRES_URL: postgresql://test:123123@postgres:5432/appdb
+      POSTGRES_URL: postgresql://app:app@postgres:5432/appdb
       QDRANT_COLLECTION: pipeline_events
       VALID_NAME: valid_vec
       VALID_DIM: "768"
@@ -46,6 +46,9 @@ services:
       VALID_EMBED_MODEL: nomic-embed-text
       ERROR_EMBED_MODEL: all-minilm
       CORS_ORIGINS: http://localhost:8080
+      SEMANTIC_MDL_PATH: /app/app/semantic/semantic.yaml
+      SEMANTIC_MODE: hybrid
+      SEMANTIC_TTL_SEC: "60"
     depends_on:
       qdrant:
         condition: service_started
