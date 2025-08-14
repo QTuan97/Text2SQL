@@ -1,0 +1,76 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.code-workspace
+
+# Python / Poetry
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.python-version
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pylint.d/
+.coverage*
+htmlcov/
+.cache/
+pip-wheel-metadata/
+.pyre/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs / temp
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+
+# Env & secrets (keep only examples)
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+id_rsa
+id_ecdsa
+id_ed25519
+
+# Docker (local-only overrides)
+docker-compose.override.yml
+.docker/
+docker/
+docker-logs/
+
+# Frontend (if you ever add a build step)
+node_modules/
+.pnp.*
+.parcel-cache/
+.vite/
+.next/
+out/
+
+# Test artifacts / coverage / reports
+coverage/
+*.coverage
+nosetests.xml
+coverage.xml
+pytestdebug.log
+
+# Tooling caches
+.eslintcache
+.prettier-cache/
+.sass-cache/
+
+# Project-specific exports (keep shared Postman, ignore local envs)
+*.local.postman_environment.json
