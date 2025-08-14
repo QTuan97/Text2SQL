@@ -6,8 +6,8 @@ import os, time
 
 import yaml
 
-from ..clients.postgres import pg_connect  # you already have this
-from .loader import build_llm_context      # reuse your existing pretty-printer
+from ..clients.postgres import pg_connect
+from .loader import build_llm_context
 
 # Modes: static (YAML only), dynamic (DB only), hybrid (DB + YAML + DB overrides)
 MODE = os.getenv("SEMANTIC_MODE", "hybrid").lower()

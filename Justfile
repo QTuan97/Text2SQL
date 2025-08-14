@@ -4,6 +4,9 @@ compose_p := "{{compose}} -p {{project}}"
 set shell := ["bash","-eu","-o","pipefail","-c"]
 set dotenv-load := true
 set export := true
+DB_SERVICE := "postgres"
+DB_USER    := "app"
+DB_NAME    := "appdb"
 API_URL    := "http://localhost:8000"
 
 up:
@@ -33,22 +36,27 @@ reup:
 	just up
 	just health
 
-pg_init:
-    docker compose exec -T postgres bash -lc 'psql -U postgres -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname=''test''" | grep -q 1 || psql -U postgres -d postgres -c "CREATE ROLE test LOGIN PASSWORD ''123123'';"'
-    docker compose exec -T postgres bash -lc 'psql -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname=''appdb''" | grep -q 1 || psql -U postgres -d postgres -c "CREATE DATABASE appdb OWNER test;"'
-    docker compose exec -T postgres psql -U postgres -d appdb -c "ALTER SCHEMA public OWNER TO app;"
-
-seed_pg:
-    docker compose exec -T postgres psql -U app -d appdb < scripts/seed_pg.sql
-
-semantic-migrate:
-	docker compose exec -T postgres psql -U app -d appdb -v ON_ERROR_STOP=1 -f - < scripts/migrate.sql
-
-semantic-seed:
-	docker compose exec -T postgres psql -U app -d appdb -v ON_ERROR_STOP=1 -f - < scripts/seed_migrate.sql
-
 semantic-reload:
-	curl -fsS -X POST "{{API_URL}}/semantic/reload" || true
+	( curl -fsS -X POST "{{API_URL}}/semantic/reload" \
+	|| curl -fsS -X POST "{{API_URL}}/api/semantic/reload" ) || true
+
+db-reset:
+	test -f scripts/db_reset.sql
+	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_reset.sql
+
+db-migrate:
+	test -f scripts/db_migrate.sql
+	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_migrate.sql
+
+db-seed:
+	test -f scripts/db_seed.sql
+	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_seed.sql
+
+lessons-migrate:
+	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/lessons.sql
+
+tables:
+	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -c "\dt+ public.*"
 
 # Tail Ollama logs
 ollama-logs:
