@@ -21,9 +21,6 @@ wipe:
 logs:
 	docker compose logs -f api
 
-ps:
-    docker compose ps
-
 health:
 	curl -s http://localhost:8000/health
 
@@ -42,32 +39,22 @@ semantic-reload:
 
 db-reset:
 	test -f scripts/db_reset.sql
-	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_reset.sql
+	{{compose}} exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_reset.sql
 
 db-migrate:
 	test -f scripts/db_migrate.sql
-	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_migrate.sql
+	{{compose}} exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_migrate.sql
 
 db-seed:
 	test -f scripts/db_seed.sql
-	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_seed.sql
+	{{compose}} exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/db_seed.sql
 
-lessons-migrate:
-	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/lessons.sql
+user-table-migrate:
+	{{compose}} exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -v ON_ERROR_STOP=1 -f - < scripts/user_schema.sql
 
 tables:
-	docker compose exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -c "\dt+ public.*"
+	{{compose}} exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -c "\dt+ public.*"
 
 # Tail Ollama logs
 ollama-logs:
   {{compose}} logs -f --tail=200 ollama
-
-# Health & restarts
-ollama-health:
-  cid=$({{compose}} ps -q ollama); docker inspect -f '{{"{{"}}.State.Status{{"}}"}}
-  {{"{{"}}if .State.Health{{"}}"}} {{"{{"}}.State.Health.Status{{"}}"}} {{"{{"}}end{{"}}"}} restarts={{"{{"}}.RestartCount{{"}}"}}' "$$cid"
-
-# Quick API checks
-ollama-ping:
-  {{compose}} exec -T ollama curl -fsS localhost:11434/api/version || true
-  {{compose}} exec -T ollama curl -fsS localhost:11434/api/tags || true

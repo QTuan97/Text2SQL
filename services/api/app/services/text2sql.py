@@ -6,30 +6,34 @@ from typing import Any, Dict, List, Optional
 
 from sqlglot import parse_one
 
-# DB + config + LLM + MDL context
-from ..clients.postgres import pg_connect
+# Config + MDL context (no direct DB access)
 from ..config import settings
 from ..semantic.provider import get_context
 
-# Optional: live schema snapshot
-try:
-    from ..clients.postgres import schema_snapshot  # type: ignore
-except Exception:
-    schema_snapshot = None  # type: ignore
+# Cached schema from Qdrant (no Postgres touch)
+from ..semantic.schema_cache import get_schema_text, ensure_known_tables_cached
 
 # Async Ollama client already used in your project
 from ..clients import ollama
 
-# Optional: FROM/JOIN table guard (soft-required; see try/except stubs below)
 try:
-    from ..semantic.sql_guard import ensure_known_tables  # type: ignore
-except Exception:
-    def ensure_known_tables(sql: str, schema: str = None) -> None:  # fallback no-op
-        return
+    from ..services.lessons import search_lessons, record_learning  # type: ignore
 
-# Optional: retrieval “lessons” (few-shot memory)
-try:
-    from ..semantic.lessons import fetch_few_shots, record_success  # type: ignore
+    async def fetch_few_shots(question: str, k: int = 3, min_sim: float = 0.55):
+        hits = await search_lessons(question, k=k, min_sim=min_sim)
+        out = []
+        for h in hits:
+            out.append({"question": h.get("question") or "", "sql": h.get("sql") or ""})
+        return out
+
+    async def record_success(question: str, sql: str, tables_used: List[str]) -> None:
+        # Idempotent upsert keyed by (question, sql)
+        await record_learning(
+            question, sql,
+            tables_used=tables_used,
+            executed=False, rowcount=0, error=None,
+            source="text2sql"
+        )
 except Exception:
     async def fetch_few_shots(question: str, k: int = 3, min_sim: float = 0.55):
         return []
@@ -166,21 +170,18 @@ async def _llm_complete(system: str, user: str) -> str:
 async def generate_sql(question: str, limit: int) -> str:
     """
     Build a grounded prompt with hybrid MDL context (+ lessons), call the LLM,
-    extract & sanitize SQL, and validate (syntax + real tables).
+    extract & sanitize SQL, and validate (syntax + cached schema).
     Raises ValueError for any non-SELECT / parse issues (route converts to 400).
     """
     if not isinstance(limit, int) or limit < 1:
         limit = 50
 
     mdl_context = get_context()
-    live_schema = ""
-    if callable(schema_snapshot):
-        try:
-            live_schema = schema_snapshot()  # optional: your existing helper
-        except Exception:
-            live_schema = ""
 
-    # Retrieve few-shot “lessons” to guide the model
+    # Load cached schema snapshot from Qdrant
+    live_schema = get_schema_text()
+
+    # Retrieve few-shot “lessons” to guide the model (from Qdrant)
     shots = await fetch_few_shots(question, k=3, min_sim=0.55)
     examples = ""
     if shots:
@@ -198,7 +199,7 @@ async def generate_sql(question: str, limit: int) -> str:
         "Never return explanations or JSON unless explicitly asked; prefer fenced SQL.\n\n"
         "# Semantic Layer (authoritative rules & joins)\n"
         f"{mdl_context}\n\n"
-        "# Live schema snapshot (for column names/types)\n"
+        "# Live schema snapshot (cached, authoritative)\n"
         f"{live_schema}\n"
         f"{examples}\n"
     )
@@ -226,17 +227,22 @@ async def generate_sql(question: str, limit: int) -> str:
     except Exception as e:
         raise ValueError(f"Bad SQL from model: {e.__class__.__name__}: {e}")
 
-    # Validate tables exist in the current DB
-    ensure_known_tables(sql, schema=getattr(settings, "PG_SCHEMA", "public"))
+    # Validate tables exist in cached schema (no DB)
+    ensure_known_tables_cached(sql)
 
-    # Record as a successful lesson (best-effort)
+    # Record as a successful lesson (best-effort, no execution info)
     try:
         from sqlglot import exp
         tnames: List[str] = []
         tree = parse_one(sql, read="postgres")
         for t in tree.find_all(exp.Table):
-            if t.this:
-                tnames.append(t.this.name)
+            tname = None
+            if hasattr(t, "name") and isinstance(t.name, str):
+                tname = t.name
+            elif getattr(t, "this", None) is not None:
+                tname = getattr(t.this, "name", None)
+            if tname:
+                tnames.append(tname)
         seen = set(); tables_used: List[str] = []
         for n in tnames:
             if n not in seen:
@@ -248,32 +254,21 @@ async def generate_sql(question: str, limit: int) -> str:
     return sql
 
 
-def execute_sql(sql: str) -> List[Dict[str, Any]]:
+def execute_sql(sql: str):
     """
-    Execute validated SQL and return rows as a list of dicts.
-    If your route expects (rows, columns), adapt accordingly.
+    Disabled: Postgres execution has been turned off in this deployment.
+    Keeping the function for import-compatibility.
     """
-    rows: List[Dict[str, Any]] = []
-    with pg_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            cols = [desc[0] for desc in (cur.description or [])]
-            for r in cur.fetchall():
-                rows.append({cols[i]: r[i] for i in range(len(cols))})
-    return rows
+    raise RuntimeError("SQL execution against Postgres is disabled in this deployment.")
 
 
 async def repair_sql(question: str, limit: int, error_message: str, prev_sql: Optional[str] = None) -> str:
     """
-    One-shot self-repair using the DB error. Returns a new validated SQL or raises ValueError.
+    One-shot self-repair using a provided DB error message. Returns a new validated SQL or raises ValueError.
+    Still validates against the cached schema (no DB introspection).
     """
     mdl_context = get_context()
-    live_schema = ""
-    if callable(schema_snapshot):
-        try:
-            live_schema = schema_snapshot()
-        except Exception:
-            live_schema = ""
+    live_schema = get_schema_text()
 
     system = (
         "You fix invalid PostgreSQL SELECT queries.\n"
@@ -281,14 +276,14 @@ async def repair_sql(question: str, limit: int, error_message: str, prev_sql: Op
         "return a corrected single SELECT statement only.\n\n"
         "# Semantic Layer\n"
         f"{mdl_context}\n\n"
-        "# Live schema snapshot\n"
+        "# Live schema snapshot (cached)\n"
         f"{live_schema}\n"
     )
 
     user = (
         f"Question: {question}\n"
         f"Previous SQL:\n{prev_sql or '(none)'}\n\n"
-        f"DB Error:\n{error_message}\n\n"
+        f"DB/Error:\n{error_message}\n\n"
         f"Rules:\n- Keep it SELECT-only.\n- Fix column/table names according to the schema above.\n"
         f"- Ensure GROUP BY correctness for aggregates.\n- If LIMIT is missing, add LIMIT {limit}.\n"
         "Return only the corrected SQL (fenced or plain).\n"
@@ -305,7 +300,7 @@ async def repair_sql(question: str, limit: int, error_message: str, prev_sql: Op
     except Exception as e:
         raise ValueError(f"Bad SQL from repair: {e.__class__.__name__}: {e}")
 
-    # Validate tables exist
-    ensure_known_tables(sql, schema=getattr(settings, "PG_SCHEMA", "public"))
+    # Validate tables exist against cached schema (no DB)
+    ensure_known_tables_cached(sql)
 
     return sql

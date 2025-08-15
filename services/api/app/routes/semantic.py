@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from ..semantic.provider import get_mdl, get_context, reload_mdl
 from ..clients.postgres import pg_connect
+import os
 
 router = APIRouter()
 

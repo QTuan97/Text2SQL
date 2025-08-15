@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .dependencies import init_app
-from .routes import health, index, search, ask, text2sql, semantic
+from .routes import health, index, search, ask, text2sql, semantic, schema
 
 def create_app() -> FastAPI:
     app = FastAPI(title="NL Stack API", version="0.2.0")
@@ -22,6 +22,7 @@ def create_app() -> FastAPI:
     app.include_router(ask.router)
     app.include_router(text2sql.router)
     app.include_router(semantic.router)
+    app.include_router(schema.router)
 
     init_app(app)
     return app

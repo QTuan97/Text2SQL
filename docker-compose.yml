@@ -61,7 +61,10 @@ services:
     restart: unless-stopped
     volumes:
       - ./services/ui:/usr/share/nginx/html:ro
-    ports: ["8080:80"]
+      - ./services/ui/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports: [ "8080:80" ]
+    depends_on:
+      - api
 
 volumes:
   qdrant_data:

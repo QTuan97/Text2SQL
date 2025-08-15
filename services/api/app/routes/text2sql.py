@@ -2,59 +2,78 @@ from __future__ import annotations
 import time
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
-from ..schemas.common import NL2SQLIn
+from ..schemas.common import NL2SQLIn, NL2SQLOut
 from ..services.text2sql import generate_sql, execute_sql, repair_sql
 from ..services.logger import log_request
 
-from ..semantic.intent_gate_embed import gate
 from ..semantic.provider import get_mdl
+from ..semantic.lessons import record_learning
 
 router = APIRouter(prefix="/text2sql", tags=["text2sql"])
 
-@router.post("")
-async def text2sql(body: NL2SQLIn, background_tasks: BackgroundTasks):
-    t0 = time.perf_counter()
-
-    # 1) Intent gate (blocks OOD like “weather”)
-    allow, info = await gate(body.question, get_mdl())
-    if not allow:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "OUT_OF_DOMAIN",
-                "message": "This looks outside the analytics domain.",
-                **info,
-            },
-        )
-
-    # 2) Generate SQL (generator should raise ValueError on bad/unclean SQL)
+def _tables_in(sql: str) -> List[str]:
     try:
-        sql = await generate_sql(body.question, body.limit)
+        tree = sqlglot.parse_one(sql, read="postgres")
+        out: List[str] = []
+        for t in tree.find_all(exp.Table):
+            # robust name extraction across sqlglot versions
+            if hasattr(t, "name") and isinstance(t.name, str):
+                out.append(t.name)
+            elif getattr(t, "this", None) is not None:
+                tn = getattr(t.this, "name", None)
+                if isinstance(tn, str):
+                    out.append(tn)
+        return [x for x in out if x]
+    except Exception:
+        return []
+
+@router.post("", response_model=NL2SQLOut)
+async def text2sql(body: NL2SQLIn, background_tasks: BackgroundTasks) -> NL2SQLOut:
+    limit = body.limit if isinstance(body.limit, int) and body.limit > 0 else 50
+
+    # 1) Generate SQL (your existing service)
+    try:
+        final_sql = await generate_sql(body.question, limit=limit)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail={"code": "BAD_SQL", "message": str(e)})
+        # model returned non-SELECT or bad SQL
+        raise HTTPException(status_code=400, detail=str(e))
 
-    out = {"sql": sql}
+    diagnostics: Dict[str, Any] = {"backend": "generate_sql", "limit": limit}
+    tables = _tables_in(final_sql)
 
-    # 3) Execute (optional) with one-shot auto-repair
-    if getattr(body, "execute", False):
+    # 2) Optionally execute; attempt one-shot repair on DB error
+    rows: Optional[List[Dict[str, Any]]] = None
+    rowcount: int = 0
+    error: Optional[str] = None
+    executed: bool = False
+
+    if body.execute:
         try:
-            rows = execute_sql(sql)
-            out["rows"] = rows
-        except Exception as e:
-            # Try self-repair once with the error message
+            rows = execute_sql(final_sql)
+            executed = True
+            rowcount = len(rows) if isinstance(rows, list) else 0
+        except Exception as ex:
             try:
-                fixed_sql = await repair_sql(body.question, body.limit, str(e), sql)
-                rows = execute_sql(fixed_sql)
-                out.update({"sql": fixed_sql, "rows": rows})
-            except Exception as e2:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"code": "EXEC_ERROR", "message": str(e2), "previous_error": str(e)},
-                )
+                repaired = await repair_sql(body.question, limit=limit, error_message=str(ex), prev_sql=final_sql)
+                final_sql = repaired
+                rows = execute_sql(final_sql)
+                executed = True
+                rowcount = len(rows) if isinstance(rows, list) else 0
+                diagnostics["repaired"] = True
+            except Exception as ex2:
+                error = str(ex2)
+                diagnostics["repaired"] = False
 
-    # 4) Log
-    ms = int((time.perf_counter() - t0) * 1000)
+    # 3) Record learning to Qdrant (idempotent upsert; non-blocking)
     background_tasks.add_task(
-        log_request, "/text2sql", "POST", 200, body.model_dump(), out, ms
+        record_learning,
+        body.question,
+        final_sql,
+        tables_used=tables,
+        executed=executed,
+        rowcount=rowcount,
+        error=error,
+        source="text2sql",
     )
-    return out
+
+    return NL2SQLOut(sql=final_sql, rows=rows, rowcount=rowcount, error=error, diagnostics=diagnostics)
