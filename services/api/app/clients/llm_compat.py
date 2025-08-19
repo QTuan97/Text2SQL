@@ -6,6 +6,7 @@ import os
 from typing import Dict, List, Optional, Any
 
 import requests
+import asyncio
 from openai import OpenAI
 
 from ..config import settings
@@ -27,6 +28,9 @@ def _client() -> OpenAI:
     """
     return OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
 
+async def _llm_complete(system: str, user: str, model: Optional[str] = None, timeout: Optional[int] = None) -> str:
+    t = timeout if isinstance(timeout, int) and timeout > 0 else 60
+    return await asyncio.to_thread(chat, user, system, model, t)
 
 def chat(prompt: str, system: str = "You are a concise assistant.", model: Optional[str] = None) -> str:
     """

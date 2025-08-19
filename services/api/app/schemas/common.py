@@ -35,6 +35,7 @@ class NL2SQLOut(BaseModel):
     rowcount: int = 0
     error: Optional[str] = None
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
+    answer: Optional[str] = None
 
 class LearnEvent(BaseModel):
     question: str

@@ -1,156 +1,125 @@
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
-import os, time, uuid
+import time, uuid
 
+from qdrant_client.models import PointStruct
 from ..config import settings
-from ..services.embeddings import embed_valid
+from ..clients.llm_compat import embed_one
+from ..semantic.repair import RepairEngine
+from ..utils.qdrant_helper import _qc, _ensure_lessons_collection
+from ..utils.record_helper import _qnorm, _canon_sql, _lesson_id
 
-try:
-    from ..dependencies import qdrant_client as _QDRANT_CLIENT
-    def _qc():
-        return _QDRANT_CLIENT
-except Exception:
-    from qdrant_client import QdrantClient
-    def _qc():
-        url = os.getenv("QDRANT_URL", getattr(settings, "QDRANT_URL", "http://qdrant:6333"))
-        return QdrantClient(url)
+# ---------- API ----------
+QUALITY_VALUES = {"good", "bad", "unknown"}
 
-from qdrant_client.models import PointStruct, Distance, VectorParams, Filter, FieldCondition, MatchValue, MatchAny
+def record_learning(question: str, sql: str, *,
+                    tables_used: Optional[List[str]] = None,
+                    executed: bool = False,
+                    rowcount: int = 0,
+                    error: Optional[str] = None,
+                    source: str = "text2sql",
+                    quality: str = "unknown",
+                    extra_tags: Optional[List[str]] = None) -> Dict[str, Any]:
 
-# Collection and vector settings
-LESSONS_COLLECTION = getattr(settings, "LESSONS_COLLECTION", os.getenv("LESSONS_COLLECTION", "sql_lessons"))
-VALID_NAME = getattr(settings, "VALID_NAME", os.getenv("VALID_NAME", "valid_vec"))
-ERROR_NAME = getattr(settings, "ERROR_NAME", os.getenv("ERROR_NAME", "error_vec"))
-VALID_DIM = int(getattr(settings, "VALID_DIM", os.getenv("VALID_DIM", "768")))
-ERROR_DIM = int(getattr(settings, "ERROR_DIM", os.getenv("ERROR_DIM", "384")))
-
-def _ensure_lessons_collection():
-    qc = _qc()
-    names = [c.name for c in qc.get_collections().collections]
-    if LESSONS_COLLECTION not in names:
-        qc.create_collection(
-            collection_name=LESSONS_COLLECTION,
-            vectors_config={
-                VALID_NAME: VectorParams(size=VALID_DIM, distance=Distance.COSINE),
-                ERROR_NAME: VectorParams(size=ERROR_DIM, distance=Distance.COSINE),
-            }
-        )
-
-def _uuid_v5(*parts: str) -> str:
-    ns = uuid.uuid5(uuid.NAMESPACE_URL, "wren-ai://lessons")
-    return str(uuid.uuid5(ns, "::".join(parts)))
-
-def _auto_tags(sql: str) -> List[str]:
-    s = (sql or "").lower()
-    tags = []
-    if " join " in s:
-        tags.append("join")
-    if " group by " in s:
-        tags.append("agg")
-    if " order by " in s:
-        tags.append("order")
-    if " limit " in s:
-        tags.append("limit")
-    if " date_trunc" in s or "interval" in s or " now()" in s or " current_date" in s:
-        tags.append("time")
-    return tags
-
-def _build_blob(question: str, sql: str, payload: Dict[str, Any]) -> str:
-    lines = [question or "", sql or ""]
-    if payload.get("topic"):
-        lines.append(f"TOPIC: {payload['topic']}")
-    if payload.get("tags"):
-        lines.append("TAGS: " + " ".join(payload["tags"]))
-    if payload.get("error"):
-        lines.append(f"ERROR: {payload['error']}")
-    if payload.get("rowcount") is not None:
-        lines.append(f"ROWS: {payload['rowcount']}")
-    return "\n".join([l for l in lines if l])
-
-async def record_learning(question: str, sql: str, *,
-                          tables_used: Optional[List[str]] = None,
-                          executed: bool = False,
-                          rowcount: int = 0,
-                          error: Optional[str] = None,
-                          topic: Optional[str] = None,
-                          source: str = "text2sql") -> Dict[str, Any]:
-    """
-    Qdrant-only persistence for learning events (no Postgres).
-    Idempotent per (question, sql) using UUIDv5.
-    """
     _ensure_lessons_collection()
     qc = _qc()
 
-    point_id = _uuid_v5(question or "", sql or "")
-    payload = {
+    # Try to auto-repair once if marked bad/unknown
+    tags = list(dict.fromkeys(extra_tags or []))
+    if quality != "good" and sql:
+        try:
+            eng = RepairEngine(limit=50)
+            candidate, remaining, applied = eng.apply(sql)
+            # accept only if parses & passes cached schema
+            parse_one(candidate, read="postgres")
+            ensure_known_tables_cached(candidate)
+            sql = candidate
+            quality = "good"
+            tags += ["auto_repaired"] + applied
+        except Exception:
+            # keep original, mark reason
+            if remaining:
+                tags += [f"repair_left:{c}" for c in remaining]
+
+    # Dedupe key & deterministic point id (overwrites instead of duplicating)
+    pid = _lesson_id(question, sql)
+
+    payload: Dict[str, Any] = {
         "kind": "lesson",
         "source": source,
         "question": question,
+        "qnorm": _qnorm(question),
         "sql": sql,
+        "canonical_sql": _canon_sql(sql),
         "tables": tables_used or [],
         "executed": bool(executed),
         "rowcount": int(rowcount or 0),
         "error": error,
-        "topic": topic or (tables_used[0] if tables_used else None),
-        "tags": _auto_tags(sql),
+        "topic": (tables_used or [None])[0],
+        "tags": list(dict.fromkeys(tags + ([] if not error else ["error"]))),
+        "quality": quality if quality in QUALITY_VALUES else "unknown",
         "created_at": int(time.time()),
     }
-    text = _build_blob(question, sql, payload)
 
-    # main vector from your existing embedding pipeline
-    v_main = await embed_valid(text)
-    if len(v_main) != VALID_DIM:
-        raise ValueError(f"Vector size mismatch for '{VALID_NAME}': expected {VALID_DIM}, got {len(v_main)}.")
-
-    # If you have a secondary embedding function, use it; else fill zeros to satisfy schema
-    try:
-        from ..services.embeddings import embed_error
-        v_aux = await embed_error(text)
-        if len(v_aux) != ERROR_DIM:
-            raise ValueError(f"Vector size mismatch for '{ERROR_NAME}': expected {ERROR_DIM}, got {len(v_aux)}.")
-    except Exception:
-        v_aux = [0.0] * ERROR_DIM
+    text = f"{question}\n{sql}\nTOPIC:{payload['topic'] or ''}\n" + (f"ERROR:{error}" if error else "")
+    v_main = embed_one(text, model=settings.VALID_EMBED_MODEL)
+    v_aux  = embed_one(text, model=settings.ERROR_EMBED_MODEL)
 
     qc.upsert(
-        collection_name=LESSONS_COLLECTION,
+        collection_name=settings.LESSONS_COLLECTION,
         points=[PointStruct(
-            id=point_id,
-            vector={VALID_NAME: v_main, ERROR_NAME: v_aux},
-            payload=payload,
+            id=pid,
+            vector={settings.VALID_NAME: v_main, settings.ERROR_NAME: v_aux},
+            payload=payload
         )]
     )
-    return {"id": point_id, "topic": payload["topic"], "tags": payload["tags"]}
+    return {"id": pid}
 
-async def search_lessons(question: str, k: int = 10, min_sim: float = 0.30,
-                         topic: Optional[str] = None, tags: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def promote_lesson(point_id: str, quality: str = "good") -> None:
+    if quality not in QUALITY_VALUES:
+        quality = "unknown"
+    _qc().set_payload(collection_name=settings.LESSONS_COLLECTION,
+                      payload={"quality": quality}, points=[point_id])
+
+async def search_lessons(
+    question: str,
+    k: int = 10,
+    min_sim: float = 0.30,
+    topic: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    require_good: bool = False,
+) -> List[Dict[str, Any]]:
     """
-    Drop-in replacement for the old Postgres + Python cosine search.
-    Returns: [{id, question, sql, tables, score}, ...]
+    ANN search over Qdrant. Returns [{id, question, sql, tables, score}, ...]
+    Signature is async to match your callers; embeddings + Qdrant calls are sync and fast for k<=50.
     """
     _ensure_lessons_collection()
     qc = _qc()
-    qv = await embed_valid(question)
 
-    # optional filter
-    flt = None
-    if topic or tags:
-        must = []
-        if topic:
-            must.append(FieldCondition(key="topic", match=MatchValue(value=topic)))
-        if tags:
-            must.append(FieldCondition(key="tags", match=MatchAny(any=tags)))
-        flt = Filter(must=must)
+    # embed query
+    qv = embed_one(question, model=settings.VALID_EMBED_MODEL)
 
-    res = qc.search(
-        collection_name=LESSONS_COLLECTION,
-        query_vector=(VALID_NAME, qv),
+    # optional filters
+    must = []
+    if topic:
+        must.append(FieldCondition(key="topic", match=MatchValue(value=topic)))
+    if tags:
+        must.append(FieldCondition(key="tags", match=MatchAny(any=tags)))
+    if require_good:
+        must.append(FieldCondition(key="quality", match=MatchValue(value="good")))
+    flt = Filter(must=must) if must else None
+
+    results = qc.search(
+        collection_name=settings.LESSONS_COLLECTION,
+        query_vector=(settings.VALID_NAME, qv),
         limit=k,
         query_filter=flt,
         with_payload=True,
         with_vectors=False,
     )
+
     out: List[Dict[str, Any]] = []
-    for r in res:
+    for r in results:
         if r.score is not None and r.score < min_sim:
             continue
         p = r.payload or {}
@@ -161,4 +130,11 @@ async def search_lessons(question: str, k: int = 10, min_sim: float = 0.30,
             "tables": p.get("tables") or [],
             "score": r.score,
         })
+    return out
+
+async def fetch_few_shots(question: str, k: int = 3, min_sim: float = 0.55):
+    hits = await search_lessons(question, k=3, min_sim=0.55, require_good=True)
+    out = []
+    for h in hits:
+        out.append({"question": h.get("question") or "", "sql": h.get("sql") or ""})
     return out

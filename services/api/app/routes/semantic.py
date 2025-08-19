@@ -20,15 +20,5 @@ def read_context():
     return {"context": get_context()}
 
 @router.post("/semantic/synonyms")
-def add_synonym(phrase: str, maps_to: str, weight: float = 1.0, approved: bool = True):
-    with pg_connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO semantic_synonyms(phrase, maps_to, weight, approved)
-                VALUES (%s,%s,%s,%s)
-                ON CONFLICT (phrase) DO UPDATE
-                SET maps_to=EXCLUDED.maps_to, weight=EXCLUDED.weight, approved=EXCLUDED.approved;
-            """, (phrase, maps_to, weight, approved))
-        conn.commit()
-    reload_mdl()
-    return {"ok": True}
+def add_synonym(*args, **kwargs):
+    raise HTTPException(status_code=410, detail="DB-backed synonyms are disabled.")

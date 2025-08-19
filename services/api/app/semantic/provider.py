@@ -97,41 +97,8 @@ def _load_yaml() -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 def _load_db_overrides(schema: str = "public") -> Dict[str, Any]:
-    """Read learned synonyms/metrics from DB (create tables if missing)."""
-    out = {"metrics": [], "synonyms": {"phrases": {}}}
-    with pg_connect() as conn:
-        with conn.cursor() as cur:
-            # ensure tables
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS semantic_synonyms (
-                  phrase TEXT PRIMARY KEY,
-                  maps_to TEXT NOT NULL,
-                  weight REAL DEFAULT 1.0,
-                  approved BOOLEAN DEFAULT TRUE
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS semantic_metrics (
-                  name TEXT PRIMARY KEY,
-                  expression TEXT NOT NULL,
-                  unit TEXT,
-                  synonyms TEXT[] DEFAULT '{}'
-                );
-            """)
-
-            # read synonyms
-            cur.execute("SELECT phrase, maps_to FROM semantic_synonyms WHERE approved IS TRUE AND COALESCE(weight,1.0) >= 0.5;")
-            for phrase, maps_to in cur.fetchall():
-                out["synonyms"]["phrases"][phrase] = maps_to
-
-            # read metrics
-            cur.execute("SELECT name, expression, unit, COALESCE(synonyms, '{}') FROM semantic_metrics;")
-            for name, expr, unit, syn in cur.fetchall():
-                m = {"name": name, "expression": expr}
-                if unit: m["unit"] = unit
-                if syn:  m["synonyms"] = syn
-                out["metrics"].append(m)
-    return out
+    """No-op: we do not use DB-backed synonyms/metrics anymore."""
+    return {"metrics": [], "synonyms": {"phrases": {}}}
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(base)
@@ -173,3 +140,12 @@ def get_context() -> str:
 def reload_mdl() -> None:
     """Manual flush."""
     _LAST.update({"ts": 0.0})
+
+def get_schema_text() -> str:
+    """Compact schema listing for LLM prompts, from current MDL (no DB)."""
+    mdl = get_mdl() or {}
+    parts = []
+    for e in mdl.get("entities", []):
+        cols = [d.get("name","") for d in e.get("dimensions", []) if d.get("name")]
+        parts.append(f"{e.get('name','')}({', '.join(cols)})")
+    return "\n".join(parts)

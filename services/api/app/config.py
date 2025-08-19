@@ -8,6 +8,9 @@ def _truthy(s: str | None, default: bool) -> bool:
     return s.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 class Settings:
+    CACHE_FIRST: bool = os.getenv("CACHE_FIRST", "true").lower() == "true"
+    CACHE_MIN_SIM: float = float(os.getenv("CACHE_MIN_SIM", "0.92"))
+
     # Core endpoints
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     QDRANT_URL: str = os.getenv("QDRANT_URL", "http://localhost:6333")

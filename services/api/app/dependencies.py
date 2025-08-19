@@ -3,7 +3,6 @@ from fastapi import FastAPI
 from qdrant_client.http.models import Distance, VectorParams
 from .config import settings
 from .clients.qdrant import qdrant_client
-from .services.logger import ensure_logs_table
 
 def _ensure_named_collection(collection_name: str) -> None:
     collections = qdrant_client.get_collections().collections
@@ -26,4 +25,3 @@ def init_app(app: FastAPI) -> None:
     @app.on_event("startup")
     def _startup() -> None:
         ensure_qdrant_collections()
-        ensure_logs_table()

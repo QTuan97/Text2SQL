@@ -1,6 +1,6 @@
 # services/api/app/services/logger.py
 from __future__ import annotations
-import time, json
+import json
 from decimal import Decimal
 from datetime import date, datetime
 from typing import Any

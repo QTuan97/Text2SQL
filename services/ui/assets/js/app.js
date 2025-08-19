@@ -121,11 +121,10 @@ $('#btnCopyAnswer').addEventListener('click', ()=>{ try { const o = JSON.parse($
 $('#btnSQLSample').addEventListener('click', ()=>{ $('#sqlQ').value = 'Top users by total order amount'; });
 $('#btnSQL').addEventListener('click', async ()=>{
   const question = $('#sqlQ').value.trim(); if (!question) return toast('Missing question','Type a question');
-  const limit = parseInt($('#sqlLimit').value||'10',10);
   const execute = $('#sqlExec').checked;
   $('#outSQL').textContent = 'Generating…'; $('#outSQLRows').innerHTML = '';
   try {
-    const out = await postJSON('/text2sql', { question, limit, execute });
+    const out = await postJSON('/text2sql', { question, execute });
     $('#outSQL').textContent = out.sql || '';
     if (Array.isArray(out.rows)) { $('#outSQLRows').innerHTML = renderRows(out.rows); }
   } catch(e){ $('#outSQL').textContent = typeof e==='string'? e : pretty(e); toast('Text2SQL error', e.detail?.toString?.() || 'Failed'); }

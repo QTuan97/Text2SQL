@@ -9,6 +9,10 @@ DB_USER    := "app"
 DB_NAME    := "appdb"
 API_URL    := "http://localhost:8000"
 
+QDRANT := "http://localhost:6333"
+COL := "sql_lessons"
+Q := 'Top 10 users by revenue'
+
 up:
 	docker compose up -d --build
 
@@ -54,6 +58,16 @@ user-table-migrate:
 
 tables:
 	{{compose}} exec -T {{DB_SERVICE}} psql -U {{DB_USER}} -d {{DB_NAME}} -c "\dt+ public.*"
+
+qdrant_tables:
+    curl -s "http://localhost:8000/schema/tables" | jq .
+    curl -s "http://localhost:8000/schema/text" | jq
+
+learn_logs:
+    curl -s -X POST "http://localhost:6333/collections/sql_lessons/points/scroll" \
+      -H 'content-type: application/json' \
+      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 10 users by revenue"}}]}}' \
+    | jq '.result.points | map({id:.id,question:.payload.question,sql:.payload.sql,quality:.payload.quality,tables:.payload.tables,created_at:.payload.created_at})'
 
 # Tail Ollama logs
 ollama-logs:

@@ -1,17 +1,16 @@
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter
 import time
 from typing import List, Any
 from ..schemas.common import AskIn
 from ..services.embeddings import embed_valid
 from ..services.retrieval import search_named
 from ..services.generation import llm
-from ..services.logger import log_request
 from ..config import settings
 
 router = APIRouter(prefix="/ask", tags=["ask"])
 
 @router.post("")
-async def ask(body: AskIn, background_tasks: BackgroundTasks):
+async def ask(body: AskIn):
     t0 = time.perf_counter()
 
     # 1) Embed and search
@@ -75,8 +74,4 @@ async def ask(body: AskIn, background_tasks: BackgroundTasks):
         "sources": [{"id": p.id, "score": p.score} for p in selected],
     }
 
-    ms = int((time.perf_counter() - t0) * 1000)
-    background_tasks.add_task(
-        log_request, "/ask", "POST", 200, body.model_dump(), out, ms
-    )
     return out

@@ -1,11 +1,10 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 import time
 import uuid
 from typing import Any, Dict
 from ..schemas.common import IndexIn
 from ..services.embeddings import embed_valid, embed_error
 from ..services.retrieval import upsert_point
-from ..services.logger import log_request
 from ..config import settings
 from ..services.chunks import make_chunks
 
@@ -30,9 +29,7 @@ def _to_qdrant_id(val: Any | None, text: str) -> int | str:
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, s))
 
 @router.post("")
-async def index_doc(doc: IndexIn, background_tasks: BackgroundTasks):
-    t0 = time.perf_counter()
-
+async def index_doc(doc: IndexIn):
     # Merge behavior: honor your provided doc.id if any, but always normalize
     vid = _to_qdrant_id(getattr(doc, "id", None), doc.text)
 
@@ -47,16 +44,14 @@ async def index_doc(doc: IndexIn, background_tasks: BackgroundTasks):
     upsert_point(vid, valid, error, payload)
 
     out = {"id": vid, "ok": True}
-    ms = int((time.perf_counter() - t0) * 1000)
-    background_tasks.add_task(log_request, "/index", "POST", 200, doc.model_dump(), out, ms)
+
     return out
 
 @router.post("/chunk")
-async def index_chunked(doc: IndexIn, background_tasks: BackgroundTasks):
+async def index_chunked(doc: IndexIn):
     """Split long text into retrievable chunks and index each with deterministic IDs.
     Safe to call with short text as well; returns 1+ points.
     """
-    t0 = time.perf_counter()
     text = doc.text or ""
     chunks = make_chunks(text) or [text]
     ids: list[str] = []
@@ -77,6 +72,5 @@ async def index_chunked(doc: IndexIn, background_tasks: BackgroundTasks):
         ids.append(chunk_id)
 
     out = {"ids": ids, "chunks": total, "ok": True}
-    ms = int((time.perf_counter() - t0) * 1000)
-    background_tasks.add_task(log_request, "/index/chunk", "POST", 200, doc.model_dump(), out, ms)
+
     return out
