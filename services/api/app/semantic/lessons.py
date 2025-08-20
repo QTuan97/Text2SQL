@@ -1,6 +1,7 @@
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
-import time, uuid
+from typing import List, Dict, Any, Optional, Iterable
+import uuid, time
+from datetime import datetime
 
 from qdrant_client.models import PointStruct
 from ..config import settings
@@ -12,53 +13,73 @@ from ..utils.record_helper import _qnorm, _canon_sql, _lesson_id
 # ---------- API ----------
 QUALITY_VALUES = {"good", "bad", "unknown"}
 
-def record_learning(question: str, sql: str, *,
-                    tables_used: Optional[List[str]] = None,
-                    executed: bool = False,
-                    rowcount: int = 0,
-                    error: Optional[str] = None,
-                    source: str = "text2sql",
-                    quality: str = "unknown",
-                    extra_tags: Optional[List[str]] = None) -> Dict[str, Any]:
+def _norm_list(x: Any) -> List[str]:
+    """
+    Normalize input (str | list | tuple | set | None) -> list[str]
+    - strips / lowercases strings
+    - removes empties
+    - preserves order (de-duped)
+    """
+    if x is None:
+        return []
+    if isinstance(x, str):
+        raw = [x]
+    elif isinstance(x, Iterable):
+        raw = list(x)
+    else:
+        raw = [x]
 
-    _ensure_lessons_collection()
+    cleaned = []
+    seen = set()
+    for v in raw:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        s = s.lower()
+        if s not in seen:
+            seen.add(s)
+            cleaned.append(s)
+    return cleaned
+
+def _first_or_none(items: List[str]) -> Optional[str]:
+    return items[0] if items else None
+
+def record_learning(
+    question: str,
+    sql: str,
+    *,
+    tables_used=None,
+    executed: bool,
+    rowcount: int,
+    error: Optional[str],
+    source: str,
+    quality: str,
+    extra_tags=None,
+    ):
+
     qc = _qc()
+    _ensure_lessons_collection()
 
-    # Try to auto-repair once if marked bad/unknown
-    tags = list(dict.fromkeys(extra_tags or []))
-    if quality != "good" and sql:
-        try:
-            eng = RepairEngine(limit=50)
-            candidate, remaining, applied = eng.apply(sql)
-            # accept only if parses & passes cached schema
-            parse_one(candidate, read="postgres")
-            ensure_known_tables_cached(candidate)
-            sql = candidate
-            quality = "good"
-            tags += ["auto_repaired"] + applied
-        except Exception:
-            # keep original, mark reason
-            if remaining:
-                tags += [f"repair_left:{c}" for c in remaining]
-
-    # Dedupe key & deterministic point id (overwrites instead of duplicating)
+    tables_list = _norm_list(tables_used)
+    tags_list = _norm_list(extra_tags)
     pid = _lesson_id(question, sql)
 
-    payload: Dict[str, Any] = {
+    payload = {
         "kind": "lesson",
-        "source": source,
+        "created_at": datetime.now() ,
+        "tables": tables_list,
         "question": question,
-        "qnorm": _qnorm(question),
         "sql": sql,
-        "canonical_sql": _canon_sql(sql),
-        "tables": tables_used or [],
+        "tables_used": tables_list,
+        "topic": _first_or_none(tables_list),
         "executed": bool(executed),
         "rowcount": int(rowcount or 0),
-        "error": error,
-        "topic": (tables_used or [None])[0],
-        "tags": list(dict.fromkeys(tags + ([] if not error else ["error"]))),
-        "quality": quality if quality in QUALITY_VALUES else "unknown",
-        "created_at": int(time.time()),
+        "error": (str(error) if error else None),
+        "source": str(source or "text2sql"),
+        "quality": str(quality or "unknown"),
+        "tags": tags_list,
     }
 
     text = f"{question}\n{sql}\nTOPIC:{payload['topic'] or ''}\n" + (f"ERROR:{error}" if error else "")

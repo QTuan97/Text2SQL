@@ -1,8 +1,8 @@
 # services/api/app/clients/llm_compat.py
 from __future__ import annotations
 
-import json
 import os
+import json , httpx
 from typing import Dict, List, Optional, Any
 
 import requests
@@ -68,11 +68,23 @@ def embed_one(text: str, model: Optional[str] = None, timeout: int = 60) -> List
     )
     r.raise_for_status()
     data = r.json()
-    # Ollama returns {"embedding":[...]} for single prompt
     vec = data.get("embedding")
     if not isinstance(vec, list):
         raise RuntimeError(f"Unexpected embedding response: {data}")
-    return vec  # type: ignore[return-value]
+    return vec
+
+async def schema_embed_one(text: str, model: str | None = None) -> list[float]:
+    base = settings.OLLAMA_BASE_URL.rstrip("/")
+    mdl  = model or settings.VALID_EMBED_MODEL
+    async with httpx.AsyncClient(timeout=60) as cx:
+        r = await cx.post(f"{base}/api/embeddings", json={"model": mdl, "prompt": text})
+        r.raise_for_status()
+        data = r.json()
+        vec = data.get("embedding") or data.get("data") or data.get("vector")
+        if not isinstance(vec, list):
+            raise RuntimeError("Unexpected embeddings response")
+        # ensure floats
+        return [float(x) for x in vec]
 
 
 def embed_many(texts: List[str], model: Optional[str] = None, timeout: int = 60) -> List[List[float]]:

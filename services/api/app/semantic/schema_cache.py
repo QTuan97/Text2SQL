@@ -10,7 +10,7 @@ from sqlglot import parse_one, exp
 
 from ..config import settings
 from ..dependencies import qdrant_client as _QC
-from ..clients.llm_compat import embed_one  # must return a list[float]
+from ..clients.llm_compat import schema_embed_one  # must return a list[float]
 
 VALID_NAME, ERROR_NAME = settings.VALID_NAME, settings.ERROR_NAME
 VALID_DIM,  ERROR_DIM  = settings.VALID_DIM, settings.ERROR_DIM
@@ -74,7 +74,7 @@ def ensure_schema_collection(qc: QdrantClient) -> None:
 
 
 # Public API
-def upsert_schema_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+async def upsert_schema_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """
     Store the whole schema snapshot into Qdrant as a single point (deterministic id).
     """
@@ -84,13 +84,13 @@ def upsert_schema_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     text = _schema_text(snapshot)
 
     # Main embedding (required)
-    v_main = embed_one(text, model=settings.VALID_EMBED_MODEL)
+    v_main = schema_embed_one(text, model=settings.VALID_EMBED_MODEL)
     if not isinstance(v_main, list) or len(v_main) != VALID_DIM:
         raise ValueError(f"{VALID_NAME} size mismatch: expected {VALID_DIM}, got {len(v_main) if isinstance(v_main, list) else 'N/A'}")
 
     # Aux embedding (best-effort)
     try:
-        v_aux = embed_one(text, model=settings.ERROR_EMBED_MODEL)
+        v_aux = schema_embed_one(text, model=settings.ERROR_EMBED_MODEL)
         if not isinstance(v_aux, list) or len(v_aux) != ERROR_DIM:
             raise ValueError("aux-embed-size-mismatch")
     except Exception:

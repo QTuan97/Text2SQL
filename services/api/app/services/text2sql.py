@@ -1,11 +1,13 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from sqlglot import parse_one
+from qdrant_client import QdrantClient
 
 from ..config import settings
+from ..semantic.trainning import query_related_schema
 from ..semantic.provider import get_context, get_schema_text
 from ..semantic.sql_guard import ensure_known_tables_cached
-from ..utils.sql_text import _extract_sql, _sanitize_sql
+from ..utils.sql_text import _extract_sql, _sanitize_sql, _time_guide, _normalize_ws
 from ..semantic.repair import RepairEngine
 
 # try to keep your existing few-shot fetch; guard if missing
@@ -38,6 +40,19 @@ async def _llm_complete(system: str, user: str) -> str:
         return await ollama.complete(model, system, user)
     raise RuntimeError("No supported LLM method on clients.ollama")
 
+# Building prompt
+def build_sql_prompt(question: str, qdrant: QdrantClient) -> str:
+    schema_docs = query_related_schema(qdrant, question, top_k=8)
+    context = "\n\n".join([d["text"] for d in schema_docs])
+
+    system = (
+        "You are a PostgreSQL expert. "
+        "Generate **valid, executable SQL** ONLY (no explanations). "
+        "Use the provided schema context; do not invent tables/columns."
+    )
+    return f"{system}\n\nSCHEMA CONTEXT:\n{context}\n\nQUESTION: {question}\nSQL:"
+
+# Generate SQL
 async def generate_sql(
     question: str,
     limit: int,
@@ -82,15 +97,16 @@ async def generate_sql(
         f"{negatives}\n"
     )
     user = (
-        f"User question: {question}\n\n"
-        "Rules:\n"
-        "- SELECT-only. No DDL/DML/CTE/multi-statement.\n"
-        "- Use explicit JOINs via the Semantic Layer relationships.\n"
-        "- For aggregates, every non-aggregated select column must be in GROUP BY.\n"
-        "- For 'top ... by ...', ORDER BY the aggregate DESC.\n"
-        f"- If LIMIT is missing, add LIMIT {limit}.\n"
-        + (f"\nExtra constraints:\n{extra_hint}\n" if extra_hint else "")
-        + "\nReturn either a single fenced SQL block, or plain SQL.\n"
+            f"User question: {question}\n\n"
+            "Rules:\n"
+            "- SELECT-only. No DDL/DML/CTE/multi-statement.\n"
+            "- After aliasing a table, ALWAYS use the alias; never reference the base table name.\n"  # NEW
+            "- Qualify ambiguous columns with the correct alias.\n"  # NEW
+            "- For aggregates, every non-aggregated select column must be in GROUP BY.\n"
+            "- For 'top ... by ...', ORDER BY the aggregate DESC.\n"
+            f"- If LIMIT is missing, add LIMIT {limit} **only for list-like queries**.\n"  # clarify (see C)
+            + (f"\nExtra constraints:\n{extra_hint}\n" if extra_hint else "")
+            + "\nReturn either a single fenced SQL block, or plain SQL.\n"
     )
 
     raw = await _llm_complete(system, user)
@@ -101,9 +117,16 @@ async def generate_sql(
     ensure_known_tables_cached(sql)
     return sql
 
-async def repair_sql(question: str, limit: int, error_message: str, prev_sql: Optional[str] = None) -> str:
+# Repair SQL
+async def repair_sql(
+    question: str,
+    limit: int,
+    error_message: str,
+    prev_sql: Optional[str] = None
+) -> str:
     limit = max(1, int(limit or 50))
 
+    # 0) try your deterministic fixer first (cheap)
     if prev_sql:
         eng = RepairEngine(limit=limit)
         candidate, remaining, applied = eng.apply(prev_sql)
@@ -112,19 +135,30 @@ async def repair_sql(question: str, limit: int, error_message: str, prev_sql: Op
             ensure_known_tables_cached(candidate)
             return _sanitize_sql(candidate, limit)
         except Exception:
-            error_message = (error_message + "\n" if error_message else "") + \
-                            f"[auto-repair tried: {', '.join(applied) or 'none'}; remaining: {', '.join(remaining) or 'none'}]"
+            # carry forward what was tried so LLM can avoid repeating it
+            error_message = (
+                (error_message + "\n") if error_message else ""
+            ) + f"[auto-repair tried: {', '.join(applied) or 'none'}; remaining: {', '.join(remaining) or 'none'}]"
 
+    # 1) build context (RAG schema FIRST)
     mdl_context = get_context()
-    live_schema = get_schema_text() or ""
+    live_schema = (get_schema_text() or "")[:2000]  # fallback only
+    qdrant: QdrantClient = get_qdrant()
+    hits = await query_related_schema(qdrant, question=question, top_k=8)
+    rag_schema = "\n\n".join([h["text"] for h in hits])[:3000]
+
+    # 2) prompt with strict alias rules + time guide
     system = (
         "You fix invalid PostgreSQL SELECT queries.\n"
         "Return a single corrected SELECT statement only—no explanations or JSON.\n\n"
+        f"{_time_guide()}\n"
+        "# Retrieved schema context (most relevant)\n"
+        f"{rag_schema or '(no retrieved context)'}\n\n"
         "# Semantic Layer\n"
         f"{mdl_context}\n\n"
-        "# Cached schema snapshot\n"
+        "# Cached schema snapshot (fallback)\n"
         f"{live_schema}\n"
-        "- Use the table alias for all column references if a table is aliased.\n"
+        "- After aliasing a table, ALWAYS use the alias; never reference the base table name.\n"
         "- Qualify ambiguous columns with the correct alias.\n"
         "- Include all non-aggregated select columns in GROUP BY when using aggregates.\n"
     )
@@ -132,13 +166,25 @@ async def repair_sql(question: str, limit: int, error_message: str, prev_sql: Op
         f"Question: {question}\n"
         f"Previous SQL:\n{prev_sql or '(none)'}\n\n"
         f"DB/Error:\n{error_message}\n\n"
-        f"Rules:\n- SELECT-only.\n- Fix names per schema.\n- If LIMIT is missing, add LIMIT {limit}.\n"
+        "Rules:\n"
+        "- SELECT-only.\n"
+        "- Fix names per schema.\n"
+        f"- If LIMIT is missing, add LIMIT {limit} only for list-like queries (not single-row aggregates).\n"
         "Return only the corrected SQL."
     )
 
     raw = await _llm_complete(system, user)
     sql = _extract_sql(raw)
     sql = _sanitize_sql(sql, limit)
+
+    # 3) de-dup guard: if LLM returned same SQL, don’t “loop” it back
+    if prev_sql and _normalize_ws(sql) == _normalize_ws(prev_sql):
+        # last-ditch: try forcing alias normalization via RepairEngine's stricter passes
+        eng = RepairEngine(limit=limit, aggressive=True)  # if you have a flag; else reuse apply()
+        candidate, _, _ = eng.apply(sql)
+        sql = candidate
+
+    # 4) validate; raise to caller if still invalid (so caller can show error once)
     parse_one(sql, read="postgres")
     ensure_known_tables_cached(sql)
     return sql

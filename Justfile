@@ -66,9 +66,56 @@ qdrant_tables:
 learn_logs:
     curl -s -X POST "http://localhost:6333/collections/sql_lessons/points/scroll" \
       -H 'content-type: application/json' \
-      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 10 users by revenue"}}]}}' \
+      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 5 users from HCMC sort by revenue"}}]}}' \
     | jq '.result.points | map({id:.id,question:.payload.question,sql:.payload.sql,quality:.payload.quality,tables:.payload.tables,created_at:.payload.created_at})'
 
-# Tail Ollama logs
-ollama-logs:
-  {{compose}} logs -f --tail=200 ollama
+learn_logs1:
+    curl -s -X POST "http://localhost:6333/collections/sql_lessons/points/scroll" \
+      -H 'content-type: application/json' \
+      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 5 users by revenue"}}]}}' \
+    | jq '.result.points | map({id:.id,question:.payload.question,sql:.payload.sql,quality:.payload.quality,tables:.payload.tables,created_at:.payload.created_at})'
+
+learn_logs2:
+    curl -s -X POST "http://localhost:6333/collections/sql_lessons/points/scroll" \
+      -H 'content-type: application/json' \
+      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 5 users sort by total order amount"}}]}}' \
+    | jq '.result.points | map({id:.id,question:.payload.question,sql:.payload.sql,quality:.payload.quality,tables:.payload.tables,created_at:.payload.created_at})'
+
+# ── Qdrant env (override when running: QDRANT_URL=... LESSONS_COLLECTION=...) ──
+QDRANT_URL           := "http://localhost:6333"
+LESSONS_COLLECTION   := "sql_lessons"
+VALID_NAME           := "valid_vec"
+VALID_DIM            := "768"
+ERROR_NAME           := "error_vec"
+ERROR_DIM            := "384"
+
+# Drop & recreate the lessons collection with named vectors
+qdrant-lessons-reset:
+    set -euo pipefail
+    if [ -n "${QDRANT_API_KEY:-}" ]; then HDR="-H"; HDRV="api-key: ${QDRANT_API_KEY}"; else HDR=""; HDRV=""; fi
+    echo "→ Deleting collection ${LESSONS_COLLECTION} (if exists)…"
+    curl -sfS ${HDR-} ${HDRV-} -X DELETE "${QDRANT_URL}/collections/${LESSONS_COLLECTION}" || true
+    echo "→ Recreating collection ${LESSONS_COLLECTION} with named vectors…"
+    DATA="{\"vectors\":{\"${VALID_NAME}\":{\"size\":${VALID_DIM},\"distance\":\"Cosine\"},\"${ERROR_NAME}\":{\"size\":${ERROR_DIM},\"distance\":\"Cosine\"}}}"
+    curl -sfS ${HDR-} ${HDRV-} -X PUT "${QDRANT_URL}/collections/${LESSONS_COLLECTION}" \
+      -H 'Content-Type: application/json' \
+      -d "$DATA"
+    echo "✓ Done."
+
+# Delete all points but keep the collection config
+qdrant-lessons-clear:
+    set -euo pipefail
+    if [ -n "${QDRANT_API_KEY:-}" ]; then HDR="-H"; HDRV="api-key: ${QDRANT_API_KEY}"; else HDR=""; HDRV=""; fi
+    echo "→ Clearing all points from ${LESSONS_COLLECTION}…"
+    curl -sfS ${HDR-} ${HDRV-} -X POST "${QDRANT_URL}/collections/${LESSONS_COLLECTION}/points/delete?wait=true" \
+      -H 'Content-Type: application/json' \
+      -d '{"filter":{"must":[]}}'
+    echo "✓ Cleared."
+
+# Count points in lessons
+qdrant-lessons-count:
+    set -euo pipefail
+    if [ -n "${QDRANT_API_KEY:-}" ]; then HDR="-H"; HDRV="api-key: ${QDRANT_API_KEY}"; else HDR=""; HDRV=""; fi
+    curl -sfS ${HDR-} ${HDRV-} -X POST "${QDRANT_URL}/collections/${LESSONS_COLLECTION}/points/count" \
+      -H 'Content-Type: application/json' \
+      -d '{"exact": true}' | jq -r '.result.count'

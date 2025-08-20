@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .dependencies import init_app
-from .routes import health, index, search, ask, text2sql, semantic, schema
+from .routes import health, index, search, ask, text2sql, schema, semantic
 
 def create_app() -> FastAPI:
     app = FastAPI(title="NL Stack API", version="0.2.0")

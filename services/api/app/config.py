@@ -31,6 +31,7 @@ class Settings:
     # Collections
     SCHEMA_COLLECTION: str = os.getenv("SCHEMA_COLLECTION", "db_schema")
     LESSONS_COLLECTION: str = os.getenv("LESSONS_COLLECTION", "sql_lessons")
+    SEMANTIC_COLLECTION: str = os.getenv("SEMANTIC_COLLECTION", "semantic_schema")
 
     # Learning behavior
     LEARN_TO_QDRANT_ONLY: bool = _truthy(os.getenv("LEARN_TO_QDRANT_ONLY", "true"), True)
