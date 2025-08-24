@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Iterable
 import re
 
 from sqlglot import parse_one, exp
@@ -65,9 +65,40 @@ def _expr_contains_agg(e: exp.Expression) -> bool:
     return any(True for _ in e.find_all((exp.Sum, exp.Avg, exp.Count, exp.Min, exp.Max, exp.ArrayAgg)))
 
 def _expr_is_simple_column(e: exp.Expression) -> bool:
-    # Bare column like "col" or "t.col"
     return isinstance(e, exp.Column)
 
+def _variants(name: str) -> Set[str]:
+    n = name.strip().lower()
+    base = n.split(".")[-1]          # drop schema prefix
+    out = {base}
+    # naive singular/plural variants
+    if base.endswith("ies"):
+        out.add(base[:-3] + "y")     # categories -> category
+    if base.endswith("s"):
+        out.add(base[:-1])           # orders -> order
+        if not base.endswith("es"):
+            out.add(base + "es")     # order -> orders/es
+    else:
+        out.add(base + "s")
+        out.add(base + "es")
+    # allow underscore/space variants if you have multiword names
+    out |= {base.replace("_", " "), base.replace(" ", "_")}
+    return {v for v in out if v}
+
+def build_ambiguity_guard() -> str:
+    names, _ = known_schema()
+    canon = sorted({t.split(".")[-1].lower() for t in names})
+    lines = []
+    for t in canon:
+        vs = sorted(_variants(t))
+        # left side = things user might say; right side = the ONLY SQL table name allowed
+        lines.append(f"- {', '.join(vs)}  ->  {t}")
+    return (
+        "# Ambiguity guard (canonical table names)\n"
+        "Use ONLY the canonical name on the right when writing SQL. "
+        "Do not invent or use other variants.\n" +
+        "\n".join(lines) + "\n"
+    )
 
 # Public: schema checks (cached only)
 def ensure_known_tables_cached(sql: str) -> None:
@@ -76,9 +107,8 @@ def ensure_known_tables_cached(sql: str) -> None:
     Uses base-name OR schema-qualified match.
     """
     try:
-        known_names, _cols = known_schema()  # expected: (Iterable[str], Optional[Dict[str, Iterable[str]]])
+        known_names, _cols = known_schema()
     except Exception:
-        # If cache is unavailable, be permissive (avoid crashing generation).
         return
 
     known_set = {str(n).lower() for n in (known_names or [])}
@@ -99,9 +129,6 @@ def ensure_known_tables_cached(sql: str) -> None:
     if missing:
         raise ValueError(f"Unknown tables in SQL: {', '.join(sorted(set(missing)))}")
 
-# Back-compat alias (fixes the bug where this called a non-existent symbol)
-def ensure_known_tables(sql: str, schema: Optional[str] = None) -> None:
-    ensure_known_tables_cached(sql)
 
 def validate_schema(sql: str) -> List[str]:
     """
@@ -129,12 +156,6 @@ def validate_schema(sql: str) -> List[str]:
             tags.append("schema-unknown-table")
             break
 
-    # Optional column validation if your cache provides it:
-    # if isinstance(cols_map, dict):
-    #     tree = parse_one(sql, read="postgres")
-    #     # map alias->table etc. (out of scope here)
-    #     # append "schema-unknown-column" if detected
-
     return tags
 
 
@@ -146,6 +167,25 @@ def lint_relative_time_bad(question: str, sql: str) -> List[str]:
     """
     if _RELATIVE_Q.search(question or "") and _HARDCODE_TIME.search(sql or "") and not _HAS_DATE_TRUNC.search(sql or ""):
         return ["relative-time-hardcode"]
+    return []
+
+def lint_alias_discipline(sql: str) -> list[str]:
+    try:
+        tree = parse_one(sql, read="postgres")
+    except Exception:
+        return []
+    # collect aliases for all tables
+    aliases = {t.alias_or_name for t in tree.find_all(exp.Table)}
+    aliases = {a.lower() for a in aliases if a}
+    base_names = {getattr(t, "name", "") for t in tree.find_all(exp.Table)}
+    base_names = {b.lower() for b in base_names if b}
+    # if we have any alias, every column must be from an alias (not a base table name)
+    if aliases:
+        for c in tree.find_all(exp.Column):
+            # c.table is the qualifier before the dot, if present
+            q = (c.table or "").lower()
+            if q and q not in aliases:
+                return ["unaliased-or-base-qualified-when-aliased"]
     return []
 
 def lint_sql(sql: str) -> List[str]:
@@ -201,6 +241,7 @@ def lint_sql(sql: str) -> List[str]:
 SEVERE_LINTS = {
     "aggregate-without-group-by",
     "relative-time-hardcode",
+    "unaliased-or-base-qualified-when-aliased",
     # add these here if you centralize schema errors as lints:
     # "schema-unknown-table", "schema-unknown-column",
 }

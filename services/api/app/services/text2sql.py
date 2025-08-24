@@ -1,13 +1,17 @@
 from __future__ import annotations
+import json
 from typing import Any, Dict, List, Optional
 from sqlglot import parse_one
 from qdrant_client import QdrantClient
 
 from ..config import settings
-from ..semantic.trainning import query_related_schema
-from ..semantic.provider import get_context, get_schema_text
-from ..semantic.sql_guard import ensure_known_tables_cached
-from ..utils.sql_text import _extract_sql, _sanitize_sql, _time_guide, _normalize_ws
+from ..dependencies import get_qdrant
+from ..clients.llm_compat import _llm_complete
+from ..semantic.training import query_related_schema
+from ..semantic.provider import get_context
+from ..semantic.sql_guard import build_ambiguity_guard
+from ..semantic.schema_cache import get_schema_text
+from ..utils.sql_text import _extract_sql, _sanitize_sql, _time_guide, _normalize_ws, plan_query
 from ..semantic.repair import RepairEngine
 
 # try to keep your existing few-shot fetch; guard if missing
@@ -16,29 +20,6 @@ try:
 except Exception:
     async def fetch_few_shots(question: str, k: int = 3, min_sim: float = 0.55):
         return []
-
-# LLM client
-try:
-    from ..clients import ollama
-except Exception:
-    ollama = None  # type: ignore
-
-async def _llm_complete(system: str, user: str) -> str:
-    model = getattr(settings, "GEN_MODEL", None) or "llama3.2:3b-instruct"
-    if ollama is None:
-        raise RuntimeError("clients.ollama unavailable")
-    # prefer chat
-    if hasattr(ollama, "chat"):
-        return await ollama.chat(model, [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ])
-    if hasattr(ollama, "generate"):
-        return await ollama.generate(model, f"{system}\n\n{user}")
-    # fallback
-    if hasattr(ollama, "complete"):
-        return await ollama.complete(model, system, user)
-    raise RuntimeError("No supported LLM method on clients.ollama")
 
 # Building prompt
 def build_sql_prompt(question: str, qdrant: QdrantClient) -> str:
@@ -59,62 +40,63 @@ async def generate_sql(
     negative_sql_examples: Optional[List[str]] = None,
     extra_hint: str = "",
 ) -> str:
-    if not isinstance(limit, int) or limit < 1: limit = 50
+    # sanitize limit
+    if not isinstance(limit, int) or limit < 1:
+        limit = 50
 
-    mdl_context = get_context()
-    live_schema = get_schema_text() or ""
+    # PLAN
+    plan = await plan_query(question)
 
-    # GOOD-only few-shots if your impl supports it; otherwise examples may be empty
-    try:
-        shots = await fetch_few_shots(question, k=3, min_sim=0.55)
-    except Exception:
-        shots = []
-    examples = ""
-    if shots:
-        blocks = []
-        for ex in shots:
-            q = (ex.get("question") if isinstance(ex, dict) else "") or ""
-            s = (ex.get("sql") if isinstance(ex, dict) else "") or ""
-            if s: blocks.append(f"-- Example (similar question): {q}\n{s}\n")
-        if blocks:
-            examples = "\n# Good examples (follow joins/structure; adapt filters):\n" + "\n".join(blocks)
+    # respect caller cap
+    if isinstance(plan.get("limit"), int) and plan["limit"] > 0:
+        plan["limit"] = min(plan["limit"], limit)
+    else:
+        plan["limit"] = limit
 
-    negatives = ""
-    if negative_sql_examples:
-        bad_blocks = [f"-- DO NOT COPY (bad example):\n{b}\n" for b in negative_sql_examples[:3] if isinstance(b, str) and b.strip()]
-        if bad_blocks:
-            negatives = "\n# Known-bad SQL for this question (avoid these patterns):\n" + "\n".join(bad_blocks)
+    # COMPOSE SQL from plan
+    mdl_context = get_context()              # optional semantic rules/joins
+    live_schema = get_schema_text() or ""    # authoritative names
+    amb = build_ambiguity_guard()            # canonical table-name mapping
 
     system = (
-        "You generate PostgreSQL SELECT queries ONLY.\n"
-        "Return a single SELECT statement for the user's question.\n"
-        "No explanations or JSON; prefer fenced SQL.\n\n"
-        "# Semantic Layer (authoritative rules & joins)\n"
-        f"{mdl_context}\n\n"
-        "# Cached schema snapshot (tables & columns)\n"
-        f"{live_schema}\n"
-        f"{examples}"
-        f"{negatives}\n"
+        "You are a SQL compiler. Given a PLAN JSON, produce exactly ONE valid PostgreSQL SELECT statement.\n"
+        "OUTPUT: a single fenced SQL block (```sql\\n...\\n```). No prose, JSON, or comments.\n\n"
+
+        "# Schema (authoritative—use these names exactly)\n"
+        f"{live_schema}\n\n"
+        f"{amb}"
+
+        "# Time patterns (use; never hardcode month numbers/years)\n"
+        "- THIS_MONTH:  created_at >= DATE_TRUNC('month', CURRENT_DATE)\n"
+        "               AND created_at <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'\n"
+        "- TODAY:       created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + INTERVAL '1 day'\n"
+        "- LAST_7_DAYS: created_at >= CURRENT_DATE - INTERVAL '7 days'\n\n"
+
+        "# Hard rules\n"
+        "- Use ONLY table names in the schema. Do not invent singular/plural variants.\n"
+        "- Alias DISCIPLINE: every table in FROM/JOIN must use the alias from the PLAN; qualify ALL columns with those aliases only.\n"
+        "- Projection DISCIPLINE: select ONLY (a) metrics from the PLAN and (b) dimensions from the PLAN. Do NOT add extra columns.\n"
+        "- If any aggregate appears, ALL non-aggregated select expressions MUST be in GROUP BY (use the PLAN dimensions only).\n"
+        "- Implement PLAN.filters; map THIS_MONTH/TODAY/LAST_7_DAYS to the standard date_trunc windows.\n"
+        "- ORDER BY must use select-list expressions or their aliases; ASC/DESC only in ORDER BY.\n"
+        f"- If LIMIT is missing, add LIMIT {plan['limit']}.\n\n"
+
+        "# Semantic layer (business joins/aliases/rules)\n"
+        f"{mdl_context}\n"
     )
+
     user = (
-            f"User question: {question}\n\n"
-            "Rules:\n"
-            "- SELECT-only. No DDL/DML/CTE/multi-statement.\n"
-            "- After aliasing a table, ALWAYS use the alias; never reference the base table name.\n"  # NEW
-            "- Qualify ambiguous columns with the correct alias.\n"  # NEW
-            "- For aggregates, every non-aggregated select column must be in GROUP BY.\n"
-            "- For 'top ... by ...', ORDER BY the aggregate DESC.\n"
-            f"- If LIMIT is missing, add LIMIT {limit} **only for list-like queries**.\n"  # clarify (see C)
-            + (f"\nExtra constraints:\n{extra_hint}\n" if extra_hint else "")
-            + "\nReturn either a single fenced SQL block, or plain SQL.\n"
+        "PLAN JSON:\n"
+        f"{json.dumps(plan, ensure_ascii=False)}\n\n"
+        + (f"Extra constraints to honor: {extra_hint}\n" if extra_hint else "")
+        + "Compose the final SQL now (one fenced block)."
     )
 
     raw = await _llm_complete(system, user)
     sql = _extract_sql(raw)
-    sql = _sanitize_sql(sql, limit)
+    sql = _sanitize_sql(sql, plan["limit"])
 
     parse_one(sql, read="postgres")
-    ensure_known_tables_cached(sql)
     return sql
 
 # Repair SQL
@@ -122,69 +104,76 @@ async def repair_sql(
     question: str,
     limit: int,
     error_message: str,
-    prev_sql: Optional[str] = None
+    prev_sql: Optional[str] = None,
 ) -> str:
     limit = max(1, int(limit or 50))
 
-    # 0) try your deterministic fixer first (cheap)
+    # deterministic quick-fix first
     if prev_sql:
         eng = RepairEngine(limit=limit)
         candidate, remaining, applied = eng.apply(prev_sql)
         try:
-            parse_one(candidate, read="postgres")
-            ensure_known_tables_cached(candidate)
+            parse_one(candidate, read="postgres")  # syntax-only; route handles schema/coverage
             return _sanitize_sql(candidate, limit)
         except Exception:
-            # carry forward what was tried so LLM can avoid repeating it
-            error_message = (
-                (error_message + "\n") if error_message else ""
-            ) + f"[auto-repair tried: {', '.join(applied) or 'none'}; remaining: {', '.join(remaining) or 'none'}]"
+            # carry forward what we tried so the LLM doesn't repeat it
+            tried = f"[auto-repair tried: {', '.join(applied) or 'none'}; remaining: {', '.join(remaining) or 'none'}]"
+            error_message = (error_message + "\n" + tried) if error_message else tried
 
-    # 1) build context (RAG schema FIRST)
-    mdl_context = get_context()
-    live_schema = (get_schema_text() or "")[:2000]  # fallback only
-    qdrant: QdrantClient = get_qdrant()
-    hits = await query_related_schema(qdrant, question=question, top_k=8)
-    rag_schema = "\n\n".join([h["text"] for h in hits])[:3000]
+    # Re-plan
+    plan = await plan_query(question)
+    # cap plan limit to caller limit
+    plan["limit"] = min(int(plan.get("limit") or limit), limit)
 
-    # 2) prompt with strict alias rules + time guide
+    mdl_context = get_context()           # business joins/aliases
+    live_schema = get_schema_text() or "" # authoritative names
+    amb = build_ambiguity_guard()         # canonical table-name mapping
+
     system = (
-        "You fix invalid PostgreSQL SELECT queries.\n"
-        "Return a single corrected SELECT statement only—no explanations or JSON.\n\n"
-        f"{_time_guide()}\n"
-        "# Retrieved schema context (most relevant)\n"
-        f"{rag_schema or '(no retrieved context)'}\n\n"
-        "# Semantic Layer\n"
-        f"{mdl_context}\n\n"
-        "# Cached schema snapshot (fallback)\n"
-        f"{live_schema}\n"
-        "- After aliasing a table, ALWAYS use the alias; never reference the base table name.\n"
-        "- Qualify ambiguous columns with the correct alias.\n"
-        "- Include all non-aggregated select columns in GROUP BY when using aggregates.\n"
+        "You fix SQL by re-compiling from a PLAN JSON. Produce exactly ONE valid PostgreSQL SELECT statement.\n"
+        "OUTPUT: a single fenced SQL block (```sql\\n...\\n```). No prose/JSON/comments.\n\n"
+
+        "# Schema (authoritative—use these names exactly)\n"
+        f"{live_schema}\n\n"
+        f"{amb}"
+
+        "# Time patterns (use; never hardcode month numbers/years)\n"
+        "- THIS_MONTH:  created_at >= DATE_TRUNC('month', CURRENT_DATE)\n"
+        "               AND created_at <  DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'\n"
+        "- TODAY:       created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + INTERVAL '1 day'\n"
+        "- LAST_7_DAYS: created_at >= CURRENT_DATE - INTERVAL '7 days'\n\n"
+
+        "# Hard rules\n"
+        "- Use ONLY table names in the schema. Do not invent singular/plural variants.\n"
+        "- Alias DISCIPLINE: every table in FROM/JOIN must use the alias from the PLAN; qualify ALL columns with those aliases only.\n"
+        "- Projection DISCIPLINE: select ONLY (a) metrics from the PLAN and (b) dimensions from the PLAN. Do NOT add extra columns.\n"
+        "- If any aggregate appears, ALL non-aggregated select expressions MUST be in GROUP BY (use the PLAN dimensions only).\n"
+        "- Implement PLAN.filters; map THIS_MONTH/TODAY/LAST_7_DAYS to the standard date_trunc windows.\n"
+        "- ORDER BY must use select-list expressions or their aliases; ASC/DESC only in ORDER BY.\n"
+        f"- If LIMIT is missing, add LIMIT {plan['limit']}.\n\n"
+
+        "# Semantic layer (business joins/aliases/rules)\n"
+        f"{mdl_context}\n"
     )
+
     user = (
-        f"Question: {question}\n"
-        f"Previous SQL:\n{prev_sql or '(none)'}\n\n"
-        f"DB/Error:\n{error_message}\n\n"
-        "Rules:\n"
-        "- SELECT-only.\n"
-        "- Fix names per schema.\n"
-        f"- If LIMIT is missing, add LIMIT {limit} only for list-like queries (not single-row aggregates).\n"
-        "Return only the corrected SQL."
+        f"Error to avoid:\n{error_message or '(none)'}\n\n"
+        "PLAN JSON:\n"
+        f"{json.dumps(plan, ensure_ascii=False)}\n\n"
+        "Re-compile the final SQL now (one fenced block)."
     )
 
     raw = await _llm_complete(system, user)
     sql = _extract_sql(raw)
-    sql = _sanitize_sql(sql, limit)
+    sql = _sanitize_sql(sql, plan["limit"])
 
-    # 3) de-dup guard: if LLM returned same SQL, don’t “loop” it back
-    if prev_sql and _normalize_ws(sql) == _normalize_ws(prev_sql):
-        # last-ditch: try forcing alias normalization via RepairEngine's stricter passes
-        eng = RepairEngine(limit=limit, aggressive=True)  # if you have a flag; else reuse apply()
+    # De-dup guard: if unchanged, try deterministic pass once more
+    def _norm_sql(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "")).strip().lower()
+    if prev_sql and _norm_sql(sql) == _norm_sql(prev_sql):
+        eng = RepairEngine(limit=limit)
         candidate, _, _ = eng.apply(sql)
         sql = candidate
 
-    # 4) validate; raise to caller if still invalid (so caller can show error once)
     parse_one(sql, read="postgres")
-    ensure_known_tables_cached(sql)
     return sql

@@ -46,6 +46,13 @@ def _norm_list(x: Any) -> List[str]:
 def _first_or_none(items: List[str]) -> Optional[str]:
     return items[0] if items else None
 
+def _question_fp(q: str) -> str:
+    import re
+    s = q.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 def record_learning(
     question: str,
     sql: str,
@@ -56,6 +63,7 @@ def record_learning(
     error: Optional[str],
     source: str,
     quality: str,
+    coverage_ok: Optional[bool] = None,
     extra_tags=None,
     ):
 
@@ -82,9 +90,48 @@ def record_learning(
         "tags": tags_list,
     }
 
+    if coverage_ok is not None:
+        payload["coverage_ok"] = bool(coverage_ok)
+
     text = f"{question}\n{sql}\nTOPIC:{payload['topic'] or ''}\n" + (f"ERROR:{error}" if error else "")
     v_main = embed_one(text, model=settings.VALID_EMBED_MODEL)
     v_aux  = embed_one(text, model=settings.ERROR_EMBED_MODEL)
+
+    q_fp = _question_fp(question)
+    payload["q_fp"] = q_fp
+
+    # If this is a *good* lesson, demote any prior "good" with the same exact question (or same fingerprint)
+    if str(quality or "").lower() == "good":
+        try:
+            filt = {"must": [
+                {"key": "quality", "match": {"value": "good"}},
+                {"key": "q_fp", "match": {"value": q_fp}},
+            ]}
+            # Scroll to collect point IDs
+            ids = []
+            next_off = None
+            while True:
+                pts, next_off = qdrant_client.scroll(
+                    collection_name=settings.LESSONS_COLLECTION,
+                    limit=128,
+                    with_payload=False,
+                    with_vectors=False,
+                    offset=next_off,
+                    scroll_filter=filt
+                )
+                if not pts: break
+                ids.extend([p.id for p in pts])
+                if next_off is None: break
+
+            # Demote older goods (we'll upsert the new one right after)
+            if ids:
+                qdrant_client.set_payload(
+                    collection_name=settings.LESSONS_COLLECTION,
+                    payload={"quality": "archived"},
+                    points=ids,
+                )
+        except Exception:
+            pass
 
     qc.upsert(
         collection_name=settings.LESSONS_COLLECTION,

@@ -1,170 +1,172 @@
-# app/semantic/schema_cache.py
+# app/services/semantic/schema_cache.py
 from __future__ import annotations
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import time
-import uuid
+import re
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance
-from sqlglot import parse_one, exp
 
-from ..config import settings
-from ..dependencies import qdrant_client as _QC
-from ..clients.llm_compat import schema_embed_one  # must return a list[float]
+from app.config import settings
+from app.dependencies import get_qdrant
 
-VALID_NAME, ERROR_NAME = settings.VALID_NAME, settings.ERROR_NAME
-VALID_DIM,  ERROR_DIM  = settings.VALID_DIM, settings.ERROR_DIM
-
-SCHEMA_POINT_UUID = uuid.uuid5(uuid.NAMESPACE_URL, "wren-ai://schema/current")
-SCHEMA_POINT_ID = str(SCHEMA_POINT_UUID)
+_CACHE: Optional[Tuple[List[str], Optional[Dict[str, List[str]]]]] = None
+_CACHE_TTL_SEC = int(getattr(settings, "SCHEMA_CACHE_TTL", 300))
+_CACHE_TS = 0.0
 
 
-# Utilities
-def _flatten_tables(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+def bust_known_schema_cache() -> None:
+    """Force the next call to reload from Qdrant."""
+    global _CACHE, _CACHE_TS
+    _CACHE = None
+    _CACHE_TS = 0.0
+
+
+# Qdrant scroll helper (API shape differs across client versions)
+def _scroll_schema_points(
+    qc: QdrantClient,
+    collection: str,
+    limit: int = 256,
+):
     """
-    Input format:
-    {
-      "tables":[{"name":"users","columns":[ "id","email" ]}, ...]
-    }
-    Columns can be strings or dicts with {"name": "..."}.
+    Yield batches of points (payload only) for doc_type == 'schema/table'.
+    Works across qdrant-client versions that use filter=... vs scroll_filter=...
     """
-    out: List[Dict[str, Any]] = []
-    for t in snapshot.get("tables", []):
-        name = str(t.get("name") or "").strip()
-        if not name:
+    offset = None
+    flt = {"must": [{"key": "doc_type", "match": {"value": "schema/table"}}]}
+    while True:
+        try:
+            points, offset = qc.scroll(
+                collection_name=collection,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+                scroll_filter=flt,  # newer clients
+            )
+        except TypeError:
+            points, offset = qc.scroll(
+                collection_name=collection,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+                filter=flt,  # older clients
+            )
+        if not points:
+            break
+        yield points
+        if offset is None:
+            break
+
+
+# Optional column extraction from free-text payload
+_COL_LINE = re.compile(r"^\s*[-*]\s*([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(|:)?", re.I)
+_COL_SECTION_START = re.compile(r"^\s*columns\s*:?\s*$", re.I)
+
+def _extract_columns_from_text(text: str) -> List[str]:
+    """
+    Best-effort: parse a 'Columns:' section (bullet list).
+    Returns a list of column names (lowercased); empty if not found.
+    """
+    if not text:
+        return []
+    cols: List[str] = []
+    in_cols = False
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if not in_cols and _COL_SECTION_START.match(line):
+            in_cols = True
             continue
-        cols_raw = t.get("columns") or []
-        cols: List[str] = []
-        for c in cols_raw:
-            if isinstance(c, str):
-                cols.append(c)
-            elif isinstance(c, dict) and c.get("name"):
-                cols.append(str(c["name"]))
-        out.append({"name": name, "columns": sorted(set(cols))})
+        if in_cols:
+            m = _COL_LINE.match(line)
+            if m:
+                cols.append(m.group(1).lower())
+            elif line.strip() == "" or line.strip().startswith("#"):
+                # keep scanning across blank/comment lines
+                continue
+            else:
+                # left the columns section
+                if cols:
+                    break
+    # de-dup preserve order
+    seen = set()
+    out = []
+    for c in cols:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
     return out
 
-def _schema_text(snapshot: Dict[str, Any]) -> str:
-    """
-    Compact, LLM-friendly description (no DB calls).
-    """
-    tables = _flatten_tables(snapshot)
-    lines = ["# Cached Schema Snapshot"]
-    for t in tables:
-        cols = ", ".join(t["columns"]) if t["columns"] else "(no columns listed)"
-        lines.append(f"- {t['name']}: {cols}")
-    return "\n".join(lines)
 
-def ensure_schema_collection(qc: QdrantClient) -> None:
-    """
-    Create the schema collection with named vectors if it doesn't exist.
-    """
-    try:
-        existing = {c.name for c in qc.get_collections().collections}
-    except Exception:
-        existing = set()
-    if settings.SCHEMA_COLLECTION in existing:
-        return
-    qc.create_collection(
-        collection_name=settings.SCHEMA_COLLECTION,
-        vectors_config={
-            VALID_NAME: VectorParams(size=VALID_DIM, distance=Distance.COSINE),
-            ERROR_NAME: VectorParams(size=ERROR_DIM, distance=Distance.COSINE),
-        },
-    )
+# Loader from Qdrant
+def _load_from_qdrant(qc: QdrantClient, collection: str) -> Tuple[List[str], Optional[Dict[str, List[str]]]]:
+    names: List[str] = []
+    cols_map: Dict[str, List[str]] = {}
+    for batch in _scroll_schema_points(qc, collection, limit=256):
+        for p in batch:
+            pl = p.payload or {}
+            schema = str(pl.get("table_schema") or "").strip()
+            table = str(pl.get("table_name") or "").strip()
+            if not table:
+                continue
+            full = f"{schema}.{table}" if schema else table
+            key = full.lower()
+            names.append(key)
+
+            # Prefer explicit 'columns' if present; else try parse from 'text'
+            cols = pl.get("columns")
+            if isinstance(cols, list) and cols:
+                cols_map[key] = [str(c).lower() for c in cols if str(c).strip()]
+            else:
+                parsed = _extract_columns_from_text(str(pl.get("text") or ""))
+                if parsed:
+                    cols_map[key] = parsed
+
+    # de-dup names, keep stable order
+    seen = set()
+    uniq = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+
+    return uniq, (cols_map or None)
 
 
 # Public API
-async def upsert_schema_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def known_schema(ttl_sec: Optional[int] = None) -> Tuple[List[str], Optional[Dict[str, List[str]]]]:
     """
-    Store the whole schema snapshot into Qdrant as a single point (deterministic id).
+    Returns (table_names, columns_map) from Qdrant:
+      - table_names: lowercased, possibly schema-qualified (e.g., 'public.orders')
+      - columns_map: optional dict[full_table_name] -> list[column_name]
+    Uses an in-process TTL cache to avoid repeated Qdrant scans.
     """
-    qc: QdrantClient = _QC
-    ensure_schema_collection(qc)
+    global _CACHE, _CACHE_TS
+    ttl = int(ttl_sec if ttl_sec is not None else _CACHE_TTL_SEC)
+    now = time.time()
+    if _CACHE and (now - _CACHE_TS) < ttl:
+        return _CACHE
 
-    text = _schema_text(snapshot)
+    qc = get_qdrant()
+    collection = getattr(settings, "SCHEMA_COLLECTION", "semantic_schema")
+    data = _load_from_qdrant(qc, collection)
+    _CACHE = data
+    _CACHE_TS = now
+    return data
 
-    # Main embedding (required)
-    v_main = schema_embed_one(text, model=settings.VALID_EMBED_MODEL)
-    if not isinstance(v_main, list) or len(v_main) != VALID_DIM:
-        raise ValueError(f"{VALID_NAME} size mismatch: expected {VALID_DIM}, got {len(v_main) if isinstance(v_main, list) else 'N/A'}")
 
-    # Aux embedding (best-effort)
-    try:
-        v_aux = schema_embed_one(text, model=settings.ERROR_EMBED_MODEL)
-        if not isinstance(v_aux, list) or len(v_aux) != ERROR_DIM:
-            raise ValueError("aux-embed-size-mismatch")
-    except Exception:
-        v_aux = [0.0] * ERROR_DIM
-
-    payload = {
-        "kind": "schema",
-        "version": int(time.time()),
-        "tables": _flatten_tables(snapshot),
-        "text": text,
-        "updated_at": int(time.time()),
-    }
-
-    qc.upsert(
-        collection_name=settings.SCHEMA_COLLECTION,
-        points=[PointStruct(
-            id=SCHEMA_POINT_ID,
-            vector={VALID_NAME: v_main, ERROR_NAME: v_aux},
-            payload=payload,
-        )],
-    )
-    return {"version": payload["version"], "tables": len(payload["tables"])}
-
-def _load_snapshot() -> Optional[Dict[str, Any]]:
-    qc: QdrantClient = _QC
-    try:
-        recs = qc.retrieve(
-            collection_name=settings.SCHEMA_COLLECTION,
-            ids=[SCHEMA_POINT_ID],
-            with_payload=True,
-        )
-    except Exception:
-        return None
-    if not recs:
-        return None
-    return recs[0].payload or {}
-
-def get_schema_text() -> str:
-    snap = _load_snapshot() or {}
-    return snap.get("text", "")
-
-def known_schema() -> Tuple[List[str], Dict[str, List[str]]]:
+def get_schema_text(max_tables: int = 500) -> str:
     """
-    Returns (table_names, columns_by_table) from the cached snapshot.
+    Build a compact text snapshot for prompts (fallback only).
+    Format: 'public.orders(id, user_id, amount, created_at)\\npublic.users(id, ...)'
+    Uses columns_map when available; otherwise lists just table names.
     """
-    snap = _load_snapshot() or {}
-    tables = snap.get("tables", [])
-    names = [t.get("name") for t in tables if t.get("name")]
-    cols = {t["name"]: list(t.get("columns") or []) for t in tables if t.get("name")}
-    return names, cols
-
-def ensure_known_tables_cached(sql: str) -> None:
-    """
-    Validate that all Table nodes in SQL exist in the cached schema (no Postgres calls).
-    """
-    names, _ = known_schema()
-    known = {n.lower() for n in names}
-
-    try:
-        tree = parse_one(sql, read="postgres")
-    except Exception as e:
-        raise ValueError(f"SQL parse failed: {e}")
-
-    unknown: List[str] = []
-    for t in tree.find_all(exp.Table):
-        # Try several shapes to get the table name robustly
-        tname = None
-        if getattr(t, "name", None):
-            tname = t.name
-        elif getattr(t, "this", None) is not None:
-            # t.this could be an Identifier with .name or a dotted path
-            tname = getattr(getattr(t.this, "this", None), "name", None) or getattr(t.this, "name", None)
-        if tname and tname.lower() not in known:
-            unknown.append(tname)
-
-    if unknown:
-        raise ValueError(f"Unknown table(s) in SQL (cached schema): {', '.join(sorted(set(unknown)))}")
+    names, cols_map = known_schema()
+    lines: List[str] = []
+    for full in names[:max_tables]:
+        cols = cols_map.get(full) if isinstance(cols_map, dict) else None
+        if cols:
+            lines.append(f"{full}({', '.join(cols)})")
+        else:
+            lines.append(full)
+    return "\n".join(lines)

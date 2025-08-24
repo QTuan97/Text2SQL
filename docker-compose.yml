@@ -34,17 +34,29 @@ services:
     build: ./services/api
     restart: unless-stopped
     environment:
-      OLLAMA_BASE_URL: http://ollama:11434
+      # --- OpenAI (LLM + embeddings) ---
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      LLM_BACKEND: openai
+      GEN_MODEL: ${GEN_MODEL:-gpt-4o-mini}
+      EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}
+      GEN_TEMPERATURE: "0"
+      GEN_TOP_P: "1"
+      GEN_MAX_TOKENS: "512"
+      GEN_SEED: "42"
+
+      # --- Qdrant ---
       QDRANT_URL: http://qdrant:6333
-      POSTGRES_URL: postgresql://appro:appro@postgres:5432/appdb
       QDRANT_COLLECTION: pipeline_events
       VALID_NAME: valid_vec
-      VALID_DIM: "768"
+      VALID_DIM: "1536"     # must match EMBED_MODEL dimension
       ERROR_NAME: error_vec
-      ERROR_DIM: "384"
-      GEN_MODEL: llama3.2:1b-instruct-q4_K_M
-      VALID_EMBED_MODEL: nomic-embed-text
-      ERROR_EMBED_MODEL: all-minilm
+      ERROR_DIM: "1536"     # keep same dim if you store error vectors
+
+      # --- Postgres ---
+      POSTGRES_URL: postgresql://app:app@postgres:5432/appdb
+
+      # --- App config ---
       CORS_ORIGINS: http://localhost:8080
       SEMANTIC_MDL_PATH: /app/app/semantic/semantic.yaml
       SEMANTIC_MODE: hybrid
@@ -52,9 +64,10 @@ services:
     depends_on:
       qdrant:
         condition: service_started
-      ollama:
-        condition: service_healthy
-    ports: ["8000:8000"]
+      postgres:
+        condition: service_started
+    ports:
+      - "8000:8000"
 
   ui:
     image: nginx:alpine

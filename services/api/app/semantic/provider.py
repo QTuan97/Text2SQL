@@ -141,11 +141,11 @@ def reload_mdl() -> None:
     """Manual flush."""
     _LAST.update({"ts": 0.0})
 
-def get_schema_text() -> str:
-    """Compact schema listing for LLM prompts, from current MDL (no DB)."""
-    mdl = get_mdl() or {}
-    parts = []
-    for e in mdl.get("entities", []):
-        cols = [d.get("name","") for d in e.get("dimensions", []) if d.get("name")]
-        parts.append(f"{e.get('name','')}({', '.join(cols)})")
-    return "\n".join(parts)
+# def get_schema_text() -> str:
+#     """Compact schema listing for LLM prompts, from current MDL (no DB)."""
+#     mdl = get_mdl() or {}
+#     parts = []
+#     for e in mdl.get("entities", []):
+#         cols = [d.get("name","") for d in e.get("dimensions", []) if d.get("name")]
+#         parts.append(f"{e.get('name','')}({', '.join(cols)})")
+#     return "\n".join(parts)

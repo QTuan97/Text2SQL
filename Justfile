@@ -66,19 +66,19 @@ qdrant_tables:
 learn_logs:
     curl -s -X POST "http://localhost:6333/collections/sql_lessons/points/scroll" \
       -H 'content-type: application/json' \
-      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 5 users from HCMC sort by revenue"}}]}}' \
+      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 5 users from Can Tho sorted by revenue"}}]}}' \
     | jq '.result.points | map({id:.id,question:.payload.question,sql:.payload.sql,quality:.payload.quality,tables:.payload.tables,created_at:.payload.created_at})'
 
 learn_logs1:
     curl -s -X POST "http://localhost:6333/collections/sql_lessons/points/scroll" \
       -H 'content-type: application/json' \
-      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 5 users by revenue"}}]}}' \
+      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 10 users by total order amount"}}]}}' \
     | jq '.result.points | map({id:.id,question:.payload.question,sql:.payload.sql,quality:.payload.quality,tables:.payload.tables,created_at:.payload.created_at})'
 
 learn_logs2:
     curl -s -X POST "http://localhost:6333/collections/sql_lessons/points/scroll" \
       -H 'content-type: application/json' \
-      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 5 users sort by total order amount"}}]}}' \
+      -d '{"limit":100,"with_payload":true,"with_vectors":false,"filter":{"must":[{"key":"kind","match":{"value":"lesson"}},{"key":"question","match":{"value":"Top 5 users lives in HCMC order by their revenue this month"}}]}}' \
     | jq '.result.points | map({id:.id,question:.payload.question,sql:.payload.sql,quality:.payload.quality,tables:.payload.tables,created_at:.payload.created_at})'
 
 # ── Qdrant env (override when running: QDRANT_URL=... LESSONS_COLLECTION=...) ──

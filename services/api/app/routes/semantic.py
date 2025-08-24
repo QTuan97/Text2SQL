@@ -3,9 +3,9 @@ from psycopg import Connection
 from qdrant_client import QdrantClient
 from ..config import settings
 from ..dependencies import get_pg_conn, get_qdrant
-from ..clients.llm_compat import schema_embed_one
+from ..clients.llm_compat import embed_one
 from ..semantic.provider import get_mdl, get_context
-from ..semantic.trainning import upsert_schema_docs, query_related_schema
+from ..semantic.training import upsert_schema_docs, query_related_schema
 from ..services.embeddings import embed_valid
 from ..semantic.schema_introspect import fetch_schema
 
@@ -88,7 +88,7 @@ async def schema_search(
     qdrant: QdrantClient = Depends(get_qdrant),
 ):
     # await the async embedder
-    vec = await schema_embed_one(question, model=settings.VALID_EMBED_MODEL)
+    vec = await embed_one(question, model=settings.VALID_EMBED_MODEL)
 
     if not isinstance(vec, list):
         raise HTTPException(status_code=500, detail="Embedding failed: not a list")

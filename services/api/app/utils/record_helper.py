@@ -40,49 +40,76 @@ def _normalize_scroll_result(res) -> List[Any]:
     except Exception:
         return []
 
-def get_cached_good_sql(question: str, *, prefer_exact: bool = True, min_sim: float = 0.92) -> Optional[dict]:
+def get_cached_good_sql(
+    question: str,
+    *,
+    prefer_exact: bool = True,
+    min_sim: float = 0.92,   # kept for API-compat; not used in exact path
+) -> Optional[dict]:
     """
-    Return {"id", "sql", "score"} if there is an existing GOOD lesson for this question.
-    1) exact match by normalized question (fast), else
-    2) vector fallback with a high threshold (handled elsewhere if you want)
+    Return {"id","sql","score"} if there is an existing GOOD lesson for this exact question.
+    1) exact match by normalized question (qnorm) with coverage_ok=True preferred
+    2) (no vector fallback here; keep this function sync)
     """
     qc = _qc()
 
-    if prefer_exact:
-        flt = Filter(must=[
-            FieldCondition(key="kind", match=MatchValue(value="lesson")),
-            FieldCondition(key="quality", match=MatchValue(value="good")),
-            FieldCondition(key="qnorm", match=MatchValue(value=_qnorm(question))),
-        ])
+    if not prefer_exact:
+        return None  # this function is the fast exact-matcher; vector fallback should live in an async variant
 
+    qn = _qnorm(question)
+
+    def _scroll(must_conditions):
+        flt = Filter(must=must_conditions)
         res = qc.scroll(
             collection_name=settings.LESSONS_COLLECTION,
             scroll_filter=flt,
-            limit=50,                 # grab a few; we’ll sort below
+            limit=50,
             with_payload=True,
             with_vectors=False,
         )
-        pts = _normalize_scroll_result(res)
+        return _normalize_scroll_result(res)
 
-        if pts:
-            # choose the best candidate: executed first, higher rowcount, then newest
-            def rank(p):
-                pl = p.payload or {}
-                return (
-                    1 if pl.get("executed") else 0,
-                    int(pl.get("rowcount") or 0),
-                    int(pl.get("last_used") or pl.get("created_at") or 0),
-                )
+    # 1) Prefer exact + coverage_ok = true (when present in payload)
+    pts = _scroll([
+        FieldCondition(key="kind",    match=MatchValue(value="lesson")),
+        FieldCondition(key="quality", match=MatchValue(value="good")),
+        FieldCondition(key="qnorm",   match=MatchValue(value=qn)),
+        FieldCondition(key="coverage_ok", match=MatchValue(value=True)),
+    ])
 
-            pts.sort(key=rank, reverse=True)
-            p = pts[0]
-            return {
-                "id": p.id,
-                "sql": (p.payload or {}).get("sql"),
-                "score": 1.0,
-            }
+    # 2) Fallback: exact + good (no coverage_ok constraint)
+    if not pts:
+        pts = _scroll([
+            FieldCondition(key="kind",    match=MatchValue(value="lesson")),
+            FieldCondition(key="quality", match=MatchValue(value="good")),
+            FieldCondition(key="qnorm",   match=MatchValue(value=qn)),
+        ])
 
-    return None
+    if not pts:
+        return None
+
+    # choose the best candidate: executed first, higher rowcount, then newest/last_used
+    def rank(p):
+        pl = p.payload or {}
+        executed = 1 if pl.get("executed") else 0
+        rowcount = int(pl.get("rowcount") or 0)
+        # support either epoch ints or ISO strings; normalize to sortable int
+        ts = pl.get("last_used") or pl.get("created_at") or 0
+        try:
+            ts_val = int(ts)
+        except Exception:
+            # ISO8601 → int fallback
+            ts_val = 0
+        coverage_bonus = 1 if pl.get("coverage_ok") is True else 0
+        return (coverage_bonus, executed, rowcount, ts_val)
+
+    pts.sort(key=rank, reverse=True)
+    p = pts[0]
+    return {
+        "id": p.id,
+        "sql": (p.payload or {}).get("sql"),
+        "score": 1.0,  # exact hit; vector score not applicable
+    }
 
 def get_same_question_negatives(question: str, limit: int = 3) -> list[str]:
     """

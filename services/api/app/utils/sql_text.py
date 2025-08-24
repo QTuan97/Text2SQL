@@ -1,7 +1,13 @@
 from __future__ import annotations
 import json, re
+from typing import Dict, Any, Optional, List
 
 from ..config import settings
+from ..dependencies import get_qdrant
+from ..clients.llm_compat import _llm_complete
+from ..semantic.training import query_related_schema
+from ..semantic.schema_cache import get_schema_text
+from ..semantic.sql_guard import build_ambiguity_guard
 
 _FENCE_OPEN  = re.compile(r'^\s*```(?:json|sql)?\s*', re.I | re.M)
 _FENCE_CLOSE = re.compile(r'\s*```\s*$', re.I)
@@ -113,3 +119,51 @@ def _sanitize_sql(sql: str, limit: int) -> str:
     if _looks_like_single_aggregate(sql):
         return sql
     return _enforce_limit(sql, limit)
+
+# Plan query
+def _extract_json(s: str) -> str:
+    s = s.strip()
+    # strip fences if present
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = s.rsplit("```", 1)[0]
+    # grab first {...} block
+    m = re.search(r"\{.*\}", s, re.S)
+    return m.group(0) if m else s
+
+async def plan_query(question: str) -> Dict[str, Any]:
+    # RAG: pull only relevant schema to keep context small
+    qc = get_qdrant()
+    hits = await query_related_schema(qc, question=question, top_k=8)
+    rag_schema = "\n".join(h["text"] for h in hits) if hits else ""
+    fallback_schema = get_schema_text() or ""
+    amb = build_ambiguity_guard()
+
+    system = (
+        "You are a SQL query PLANNER. Output STRICT JSON ONLY, no prose, no code fences.\n"
+        "Your job: convert the user question into a minimal structured plan for a PostgreSQL SELECT query.\n\n"
+        "# Relevant schema (authoritative names)\n"
+        f"{rag_schema or fallback_schema}\n\n"
+        f"{amb}\n"
+        "# Time hints (use names, do not expand to SQL here)\n"
+        "- THIS_MONTH, TODAY, LAST_7_DAYS\n\n"
+        "# JSON schema to output (all keys required):\n"
+        "{\n"
+        '  "tables":     ["<table1> <alias1>", "..."],               // every table must include a short alias\n'
+        '  "joins":      [{"left":"u","right":"o","on":"u.id=o.user_id"}],\n'
+        '  "dimensions": ["u.name","u.city"],                        // non-aggregated select columns\n'
+        '  "metrics":    [{"alias":"revenue","expr":"SUM(o.amount)"}],\n'
+        '  "filters":    ["u.city = \'Can Tho\'", "THIS_MONTH?"],    // literals or time keywords only\n'
+        '  "order_by":   [{"expr":"revenue","dir":"DESC"}],\n'
+        '  "limit":      5\n'
+        "}\n"
+        "Notes: use ONLY canonical table names from the schema; attach aliases you invent (1–2 letters). "
+        "If the question does not ask for a field, do not include it as a dimension."
+    )
+    user = f"Question: {question}\nReturn ONLY the JSON plan."
+    raw = await _llm_complete(system, user)
+    data = json.loads(_extract_json(raw))
+    # minimal validation
+    for k in ["tables","joins","dimensions","metrics","filters","order_by","limit"]:
+        data.setdefault(k, [] if k!="limit" else 50)
+    return data

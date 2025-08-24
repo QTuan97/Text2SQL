@@ -28,6 +28,14 @@ class Settings:
     VALID_EMBED_MODEL: str = os.getenv("VALID_EMBED_MODEL", "nomic-embed-text")
     ERROR_EMBED_MODEL: str = os.getenv("ERROR_EMBED_MODEL", "all-minilm")
 
+    # Model settings
+    GEN_TEMPERATURE = 0.0
+    GEN_TOP_P = 1.0
+    GEN_TOP_K = 0
+    GEN_REPEAT_PENALTY = 1.0
+    GEN_MAX_TOKENS = 512
+    GEN_SEED = 42
+
     # Collections
     SCHEMA_COLLECTION: str = os.getenv("SCHEMA_COLLECTION", "db_schema")
     LESSONS_COLLECTION: str = os.getenv("LESSONS_COLLECTION", "sql_lessons")
@@ -40,10 +48,6 @@ class Settings:
     # CORS
     CORS_ORIGINS: List[str] = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:8080").split(",") if o.strip()]
 
-    # ---- Derived for llm_compat (OpenAI-compatible + embeddings) ----
-    # Chat Completions-compatible base (Ollama exposes /v1)
-    OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL") or (OLLAMA_BASE_URL.rstrip("/") + "/v1")
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "ollama")  # dummy is fine for Ollama
     # Native Ollama HTTP base for embeddings
     OLLAMA_API_BASE: str = os.getenv("OLLAMA_API_BASE") or OLLAMA_BASE_URL
 
